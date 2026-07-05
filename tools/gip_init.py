@@ -356,18 +356,23 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
 
 def stream_audio_out(dev, stop: threading.Event) -> None:
     """Send silence on EP3 OUT (isochronous) to open the bidirectional audio channel.
-    USB isochronous audio requires the host to continuously feed the OUT endpoint;
-    the device won't activate EP3 IN (mic) until the output stream is running.
-    Format: 2-byte LE length header + raw PCM silence (gip_pkt_audio_samples)."""
-    # 48kHz stereo 16-bit = 192 bytes/ms
-    audio_len = 192
-    silence = struct.pack("<H", audio_len) + bytes(audio_len)  # 194 bytes total
-    interval = 0.001  # 1ms
-    print("[audio-out] Streaming silence on EP3 OUT to open audio channel...")
+    Tries three formats in sequence to discover which one the device accepts."""
+    candidates = [
+        ("194B (2B header + 192B PCM)", struct.pack("<H", 192) + bytes(192)),
+        ("192B raw PCM (no header)",    bytes(192)),
+        ("228B raw (max packet)",       bytes(228)),
+    ]
+    fmt_name, silence = candidates[0]
+    print(f"[audio-out] Streaming silence on EP3 OUT — format: {fmt_name}")
+    sent = 0
     errors = 0
+    last_log = time.time()
+    fmt_idx = 0
+
     while not stop.is_set():
         try:
-            dev.write(EP_AUDIO_OUT, silence, timeout=10)
+            dev.write(EP_AUDIO_OUT, silence, timeout=5)
+            sent += 1
             errors = 0
         except usb.core.USBTimeoutError:
             pass
@@ -375,10 +380,19 @@ def stream_audio_out(dev, stop: threading.Event) -> None:
             errors += 1
             if errors == 1:
                 print(f"[audio-out] write error: {e}")
-            if errors > 50:
-                print("[audio-out] too many errors, stopping output stream")
-                break
-        time.sleep(interval)
+            if errors > 100:
+                # Try next format
+                fmt_idx = (fmt_idx + 1) % len(candidates)
+                fmt_name, silence = candidates[fmt_idx]
+                print(f"[audio-out] switching format → {fmt_name}")
+                errors = 0
+
+        now = time.time()
+        if now - last_log >= 5.0:
+            print(f"[audio-out] {sent} packets sent in last 5s "
+                  f"({sent/5:.0f}/s) — format: {fmt_name}")
+            sent = 0
+            last_log = now
 
 
 def monitor_audio(dev, stop: threading.Event) -> None:
@@ -451,6 +465,17 @@ def main():
 
     time.sleep(0.1)
 
+    # Start isochronous audio stream BEFORE GIP init — some devices activate
+    # the channel as soon as SET_INTERFACE alt=1 is done, not after handshake.
+    stop = threading.Event()
+    seq_ref = [10]
+    print("\nPre-warming EP3 isochronous channel...")
+    t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True)
+    t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop), daemon=True)
+    t_audio_out.start()
+    t_audio_in.start()
+    time.sleep(0.5)  # let the stream settle before GIP init
+
     gip_init(dev)
 
     print("\n" + "=" * 60)
@@ -458,13 +483,9 @@ def main():
     print("Ctrl+C to stop")
     print("=" * 60 + "\n")
 
-    stop = threading.Event()
-    seq_ref = [10]  # shared mutable sequence counter for monitor_gip replies
     threads = [
-        threading.Thread(target=monitor_gip,    args=(dev, uinput_fd, stop, seq_ref), daemon=True),
-        threading.Thread(target=monitor_ctrl,   args=(dev, stop), daemon=True),
-        threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True),
-        threading.Thread(target=monitor_audio,  args=(dev, stop), daemon=True),
+        threading.Thread(target=monitor_gip,  args=(dev, uinput_fd, stop, seq_ref), daemon=True),
+        threading.Thread(target=monitor_ctrl, args=(dev, stop), daemon=True),
     ]
     for t in threads:
         t.start()
