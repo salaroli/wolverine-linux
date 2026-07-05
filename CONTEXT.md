@@ -102,7 +102,7 @@ Formato 48kHz stereo = `0x10`. Device **sempre ecoa** confirmando aceitação.
 
 ### Headphone jack e microfone
 
-**Conclusão:** limitação de hardware/firmware — áudio é **exclusivo do Xbox**, não funciona em PC.
+**Conclusão:** limitação de hardware/firmware — áudio é **exclusivo do Xbox**, não funciona em PC. **DEFINITIVAMENTE ENCERRADO.**
 
 **Evidências:**
 - Razer documenta oficialmente: "game/chat volume control is only applicable for Xbox One"
@@ -111,7 +111,21 @@ Formato 48kHz stereo = `0x10`. Device **sempre ecoa** confirmando aceitação.
 - Enviar tom de 440Hz no EP3 OUT: não audível nos fones
 - Microfone: 1000 reads/s no EP3 IN, todos zeros, mesmo falando no mic
 - Comando VOLUME (sub 0x03): sempre timeout, device ignora
-- O device usa a pilha de áudio proprietária do Xbox OS — sem ela, o roteamento interno não liga
+
+**Investigação de auth GIP (cmd=0x06) — concluída:**
+- O device **não implementa GIP auth** (cmd=0x06). Silêncio total de 8 segundos após HOST_HELLO.
+- A hipótese de que auth era o gate para o áudio foi descartada.
+- O device usa versão simplificada de GIP sem handshake de autenticação.
+- O bloqueio de áudio é no firmware/hardware, independente de auth.
+
+**Investigação de GIP IDENTIFY:**
+- O device responde ao IDENTIFY com STATUS heartbeat (seq=71), não com IDENTIFY response.
+- O seq=71 indica que xpad já fez ~70 trocas antes de ser detachado — device está em estado estabelecido.
+- Para capturar o IDENTIFY response completo seria necessário reset USB antes de clamar as interfaces.
+
+**Comandos Razer proprietários (descobertos no probe):**
+- CMD 0x0f → resposta de 64B com cmd=0x10 (propósito desconhecido — pode ser info de firmware)
+- Esses são comandos Razer-específicos fora do spec GIP padrão.
 
 ### Botões de mídia
 
