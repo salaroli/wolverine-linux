@@ -313,9 +313,34 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
             time.sleep(0.1)
 
 
+def stream_audio_out(dev, stop: threading.Event) -> None:
+    """Send silence on EP3 OUT (isochronous) to open the bidirectional audio channel.
+    USB isochronous audio requires the host to continuously feed the OUT endpoint;
+    the device won't activate EP3 IN (mic) until the output stream is running."""
+    # 48kHz stereo 16-bit = 192 bytes/ms; pad to max packet size (228)
+    silence = bytes(192)
+    interval = 0.001  # 1ms
+    print("[audio-out] Streaming silence on EP3 OUT to open audio channel...")
+    errors = 0
+    while not stop.is_set():
+        try:
+            dev.write(EP_AUDIO_OUT, silence, timeout=10)
+            errors = 0
+        except usb.core.USBTimeoutError:
+            pass
+        except usb.core.USBError as e:
+            errors += 1
+            if errors == 1:
+                print(f"[audio-out] write error: {e}")
+            if errors > 50:
+                print("[audio-out] too many errors, stopping output stream")
+                break
+        time.sleep(interval)
+
+
 def monitor_audio(dev, stop: threading.Event) -> None:
     """Read EP3 IN — isochronous mic stream."""
-    print("[audio] Monitoring EP3 IN (isochronous mic)...")
+    print("[audio-in]  Monitoring EP3 IN (isochronous mic)...")
     count = 0
     while not stop.is_set():
         try:
@@ -324,17 +349,17 @@ def monitor_audio(dev, stop: threading.Event) -> None:
                 count += 1
                 if count <= 3:
                     ts = time.strftime("%H:%M:%S")
-                    print(f"\n[audio {ts}] EP3 IN {len(data)} bytes (#{count}):")
+                    print(f"\n[audio-in {ts}] EP3 IN {len(data)} bytes (#{count}):")
                     hexdump(data)
                 elif count == 4:
-                    print("[audio] ✓ Stream active — audio is flowing!")
+                    print("[audio-in] ✓ Stream active — mic audio is flowing!")
         except usb.core.USBTimeoutError:
             if count > 0:
-                print(f"[audio] stream paused after {count} packets")
+                print(f"[audio-in] stream paused after {count} packets")
                 count = 0
         except usb.core.USBError as e:
             if not stop.is_set():
-                print(f"[audio] error: {e}")
+                print(f"[audio-in] error: {e}")
             time.sleep(0.1)
 
 
@@ -393,9 +418,10 @@ def main():
     stop = threading.Event()
     seq_ref = [10]  # shared mutable sequence counter for monitor_gip replies
     threads = [
-        threading.Thread(target=monitor_gip,   args=(dev, uinput_fd, stop, seq_ref), daemon=True),
-        threading.Thread(target=monitor_ctrl,  args=(dev, stop), daemon=True),
-        threading.Thread(target=monitor_audio, args=(dev, stop), daemon=True),
+        threading.Thread(target=monitor_gip,    args=(dev, uinput_fd, stop, seq_ref), daemon=True),
+        threading.Thread(target=monitor_ctrl,   args=(dev, stop), daemon=True),
+        threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True),
+        threading.Thread(target=monitor_audio,  args=(dev, stop), daemon=True),
     ]
     for t in threads:
         t.start()
