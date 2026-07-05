@@ -307,15 +307,16 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] AUDIO_CONTROL subcommand=0x{sub:02x}:")
                 hexdump(data)
-                # Device sends its volume state — echo back in same format (subcommand 0x00)
+                # Device sends its volume state — echo back with max volumes
                 if sub == 0x00 and len(data) >= 9:
-                    state, v1, v2, v3 = data[5], data[6], data[7], data[8]
+                    state = data[5]
+                    # Boost to max (0x64=100) regardless of what device reported
                     s = seq_ref[0]; seq_ref[0] += 1
                     try:
                         dev.write(EP_GIP_OUT,
-                                  pkt_audio_volume_chat(s, state, v1, v2, v3),
+                                  pkt_audio_volume_chat(s, state, 0x64, 0x64, 0x64),
                                   timeout=TIMEOUT_MS)
-                        print(f"  → sent VOLUME_CHAT echo (seq={s}, state=0x{state:02x})")
+                        print(f"  → sent VOLUME_CHAT max volumes (seq={s}, state=0x{state:02x})")
                     except usb.core.USBError as e:
                         print(f"  → VOLUME_CHAT send failed: {e}")
                 # ACK if requested
@@ -354,24 +355,41 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
             time.sleep(0.1)
 
 
+def _gen_tone(freq: int = 440, sample_rate: int = 48000,
+              channels: int = 2, duration_ms: int = 1) -> bytes:
+    """Generate one ms of a sine wave tone as signed 16-bit PCM."""
+    import math
+    n_samples = sample_rate * duration_ms // 1000
+    out = []
+    for i in range(n_samples):
+        val = int(32767 * 0.3 * math.sin(2 * math.pi * freq * i / sample_rate))
+        packed = struct.pack("<h", val)
+        out.append(packed * channels)
+    return b"".join(out)
+
+
 def stream_audio_out(dev, stop: threading.Event) -> None:
-    """Send silence on EP3 OUT (isochronous) to open the bidirectional audio channel.
-    Tries three formats in sequence to discover which one the device accepts."""
-    candidates = [
-        ("194B (2B header + 192B PCM)", struct.pack("<H", 192) + bytes(192)),
-        ("192B raw PCM (no header)",    bytes(192)),
-        ("228B raw (max packet)",       bytes(228)),
-    ]
-    fmt_name, silence = candidates[0]
-    print(f"[audio-out] Streaming silence on EP3 OUT — format: {fmt_name}")
+    """Send audio on EP3 OUT. Starts with a 440Hz tone to verify headphone
+    output and potentially trigger the mic input path, then switches to silence."""
+    tone    = struct.pack("<H", 192) + _gen_tone(440, 48000, 2, 1)[:192]
+    silence = struct.pack("<H", 192) + bytes(192)
+
+    tone_duration = 5.0  # seconds of tone at startup
+    start = time.time()
     sent = 0
     errors = 0
     last_log = time.time()
-    fmt_idx = 0
+    playing_tone = True
+    print(f"[audio-out] Playing 440Hz tone for {tone_duration:.0f}s on EP3 OUT "
+          f"(should hear in headphones)...")
 
     while not stop.is_set():
+        now = time.time()
+        playing_tone = (now - start) < tone_duration
+        packet = tone if playing_tone else silence
+
         try:
-            dev.write(EP_AUDIO_OUT, silence, timeout=5)
+            dev.write(EP_AUDIO_OUT, packet, timeout=5)
             sent += 1
             errors = 0
         except usb.core.USBTimeoutError:
@@ -381,16 +399,15 @@ def stream_audio_out(dev, stop: threading.Event) -> None:
             if errors == 1:
                 print(f"[audio-out] write error: {e}")
             if errors > 100:
-                # Try next format
-                fmt_idx = (fmt_idx + 1) % len(candidates)
-                fmt_name, silence = candidates[fmt_idx]
-                print(f"[audio-out] switching format → {fmt_name}")
-                errors = 0
+                print("[audio-out] too many errors, stopping")
+                break
 
-        now = time.time()
+        if not playing_tone and sent == 1:
+            print("[audio-out] Tone done — switching to silence")
+
         if now - last_log >= 5.0:
-            print(f"[audio-out] {sent} packets sent in last 5s "
-                  f"({sent/5:.0f}/s) — format: {fmt_name}")
+            label = "tone" if playing_tone else "silence"
+            print(f"[audio-out] {sent} packets/5s ({sent/5:.0f}/s) — {label}")
             sent = 0
             last_log = now
 
