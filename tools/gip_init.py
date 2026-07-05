@@ -443,15 +443,12 @@ def _recv_auth_pkt(dev, timeout_sec: float = 5.0):
             continue
         rcmd, ropts, rseq, hdr_len, pkt_len, chunk_offset = h
 
-        if rcmd == GIP_CMD_STATUS:
-            # Heartbeat — echo back so device stays happy
-            pass  # handled by monitor thread later; ignore here
-        elif rcmd == GIP_CMD_ACKNOWLEDGE:
-            pass  # ignore GIP-level ACKs during recv
-        elif rcmd == GIP_CMD_INPUT:
-            pass  # gamepad input — ignore during auth
-        elif rcmd != GIP_CMD_AUTHENTICATE:
-            pass  # other commands — ignore
+        if rcmd != GIP_CMD_AUTHENTICATE:
+            # Log everything non-AUTH so we can see the device's true response
+            print(f"  [auth] non-AUTH pkt: cmd=0x{rcmd:02x} opts=0x{ropts:02x} "
+                  f"seq={rseq} pkt_len={pkt_len}B chunk_off={chunk_offset}")
+            if pkt_len > 0:
+                _hexdump(raw[hdr_len:hdr_len + min(pkt_len, 32)])
         else:
             # AUTH packet
             chunk_data = raw[hdr_len:hdr_len + pkt_len]
@@ -930,6 +927,85 @@ def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# IDENTIFY response receiver
+# ---------------------------------------------------------------------------
+
+def _receive_identify_response(dev, our_seq: int) -> bytes | None:
+    """Receive the device's IDENTIFY response, sending proper ACKs for each chunk.
+    Prints raw bytes so we can decode the device's capability advertisement.
+    Returns the full payload or None.
+    """
+    chunk_buf   = None
+    chunk_total = 0
+    chunk_recvd = 0
+    deadline    = time.time() + 2.0
+
+    while time.time() < deadline:
+        ms = max(50, int((deadline - time.time()) * 1000))
+        try:
+            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=min(ms, 300)))
+        except usb.core.USBTimeoutError:
+            break
+        except usb.core.USBError:
+            break
+
+        if not raw:
+            continue
+
+        h = decode_gip_header(raw)
+        if not h:
+            continue
+        rcmd, ropts, rseq, hdr_len, pkt_len, chunk_offset = h
+
+        print(f"  ← cmd=0x{rcmd:02x} opts=0x{ropts:02x} seq={rseq} "
+              f"pkt_len={pkt_len} chunk_off={chunk_offset}")
+        hexdump(raw[:min(len(raw), 32)])
+
+        if rcmd != GIP_CMD_IDENTIFY:
+            # Not IDENTIFY — might be STATUS, ANNOUNCE, etc.; skip
+            continue
+
+        chunk_data = raw[hdr_len:hdr_len + pkt_len]
+
+        if ropts & GIP_OPT_CHUNK_START:
+            chunk_total = chunk_offset          # total expected length
+            chunk_buf   = bytearray(max(chunk_total, pkt_len))
+            chunk_buf[0:pkt_len] = chunk_data
+            chunk_recvd = pkt_len
+            if ropts & GIP_OPT_ACK:
+                _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_IDENTIFY,
+                                        chunk_recvd, chunk_total)
+        elif ropts & GIP_OPT_CHUNK:
+            if pkt_len == 0:
+                print(f"  IDENTIFY response complete ({chunk_recvd}B total)")
+                break
+            if chunk_buf is not None:
+                end = chunk_offset + pkt_len
+                if end <= len(chunk_buf):
+                    chunk_buf[chunk_offset:end] = chunk_data
+                chunk_recvd = max(chunk_recvd, end)
+            if ropts & GIP_OPT_ACK:
+                _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_IDENTIFY,
+                                        chunk_recvd, chunk_total)
+            if chunk_recvd >= chunk_total > 0:
+                print(f"  IDENTIFY response complete ({chunk_recvd}B total)")
+                break
+        else:
+            # Single non-chunked IDENTIFY response
+            chunk_buf   = bytearray(chunk_data)
+            chunk_recvd = pkt_len
+            print(f"  IDENTIFY response (non-chunked, {chunk_recvd}B)")
+            break
+
+    if chunk_buf and chunk_recvd:
+        data = bytes(chunk_buf[:chunk_recvd])
+        print(f"\n  Full IDENTIFY payload ({chunk_recvd}B):")
+        hexdump(data)
+        return data
+    return None
+
+
+# ---------------------------------------------------------------------------
 # GIP init sequence
 # ---------------------------------------------------------------------------
 
@@ -944,22 +1020,9 @@ def gip_init(dev) -> list:
     print("=" * 60)
     gip_send(dev, pkt_identify(seq_ref[0]), "IDENTIFY")
     seq_ref[0] += 1
-    # Drain any pending packets (device may send chunked IDENTIFY response)
-    deadline = time.time() + 0.5
-    while time.time() < deadline:
-        try:
-            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=100))
-            if raw:
-                h = decode_gip_header(raw)
-                if h:
-                    print(f"  ← cmd=0x{h[0]:02x} ({len(raw)}B)")
-                    # ACK chunked responses from device
-                    if h[1] & GIP_OPT_CHUNK and h[1] & GIP_OPT_ACK:
-                        _send_gip_ack_for_chunk(dev, h[2], h[0], 0, 0)
-        except usb.core.USBTimeoutError:
-            break
-        except usb.core.USBError:
-            break
+    # Receive and ACK the device's IDENTIFY response (may be chunked).
+    # Without proper chunk ACKs the device stays stuck and won't respond to AUTH.
+    _receive_identify_response(dev, seq_ref[0])
 
     print("\n" + "=" * 60)
     print("STEP 2 — GIP AUTH HANDSHAKE")
