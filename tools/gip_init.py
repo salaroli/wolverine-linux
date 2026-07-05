@@ -448,13 +448,6 @@ def main():
         except usb.core.USBError as e:
             print(f"  Interface {iface}: {e}")
 
-    for iface in [1, 2]:
-        try:
-            dev.set_interface_altsetting(interface=iface, alternate_setting=1)
-            print(f"  Interface {iface} alt setting 1 active (endpoints enabled)")
-        except usb.core.USBError as e:
-            print(f"  Interface {iface} alt setting: {e}")
-
     print("\nCreating virtual gamepad (uinput)...")
     try:
         uinput_fd = create_uinput_gamepad()
@@ -463,20 +456,31 @@ def main():
         print(f"  WARNING: uinput failed ({e}) — gamepad forwarding disabled")
         uinput_fd = None
 
-    time.sleep(0.1)
-
-    # Start isochronous audio stream BEFORE GIP init — some devices activate
-    # the channel as soon as SET_INTERFACE alt=1 is done, not after handshake.
     stop = threading.Event()
     seq_ref = [10]
-    print("\nPre-warming EP3 isochronous channel...")
+
+    # GIP init with interfaces in alt=0 (no isochronous endpoints yet).
+    # Standard USB audio: negotiate format first, then activate alt=1.
+    print("\nRunning GIP init (isochronous endpoints still idle)...")
+    gip_init(dev)
+
+    # NOW activate alt=1 — isochronous endpoints come alive after format is agreed.
+    print("\nActivating isochronous endpoints (alt setting 1)...")
+    for iface in [1, 2]:
+        try:
+            dev.set_interface_altsetting(interface=iface, alternate_setting=1)
+            print(f"  Interface {iface} alt setting 1 active")
+        except usb.core.USBError as e:
+            print(f"  Interface {iface} alt setting: {e}")
+
+    time.sleep(0.1)
+
+    # Start audio streams after alt=1 is live
+    print("Starting EP3 audio streams...")
     t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True)
     t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop), daemon=True)
     t_audio_out.start()
     t_audio_in.start()
-    time.sleep(0.5)  # let the stream settle before GIP init
-
-    gip_init(dev)
 
     print("\n" + "=" * 60)
     print("MONITORING — press buttons, media keys, plug headset")
