@@ -1,60 +1,132 @@
 #!/usr/bin/env python3
 """
-Razer Wolverine Ultimate — GIP audio initialization
-Detaches xpad from interface 0, takes full control of the device,
-implements GIP audio handshake, and forwards gamepad events via uinput.
+Razer Wolverine Ultimate — GIP driver with full auth handshake.
 
-Protocol reference: github.com/medusalix/xone, TheNathannator's GIP notes.
+Detaches xpad, claims all interfaces, performs the Xbox GIP authentication
+(TLS-like RSA/ECDH handshake via cmd 0x06), negotiates audio format, then
+forwards gamepad events via uinput and monitors audio/control endpoints.
+
+Protocol: github.com/medusalix/xone  |  MS-GIPUSB open spec (Sep 2024)
 Run as root.
 """
 
 import os
 import sys
 import time
+import hmac
 import struct
+import hashlib
 import threading
 import usb.core
 import usb.util
 from evdev import UInput, AbsInfo, ecodes
 
+try:
+    from cryptography.hazmat.primitives.asymmetric import padding as _rsa_pad
+    from cryptography.hazmat.primitives.serialization import load_der_public_key as _load_der_pub
+    from cryptography.hazmat.primitives.asymmetric.ec import (
+        ECDH as _ECDH,
+        generate_private_key as _gen_ec_key,
+        SECP256R1 as _P256,
+        EllipticCurvePublicNumbers as _ECPubNums,
+    )
+    from cryptography.hazmat.backends import default_backend as _crypto_backend
+    _CRYPTO_OK = True
+except ImportError:
+    _CRYPTO_OK = False
+    print("WARNING: 'cryptography' library not found — GIP auth disabled")
+
 VENDOR_ID  = 0x1532
 PRODUCT_ID = 0x0a14
 
+# ---------------------------------------------------------------------------
 # Endpoints
-EP_GIP_OUT   = 0x01   # interrupt, interface 0 — main GIP channel
-EP_GIP_IN    = 0x81
-EP_CTRL_OUT  = 0x02   # bulk, interface 2 — secondary (purpose TBD)
-EP_CTRL_IN   = 0x82
-EP_AUDIO_OUT = 0x03   # isochronous, interface 1 — audio playback
-EP_AUDIO_IN  = 0x83   # isochronous, interface 1 — mic capture
+# ---------------------------------------------------------------------------
 
-# GIP command IDs
+EP_GIP_OUT   = 0x01   # interrupt, interface 0
+EP_GIP_IN    = 0x81
+EP_CTRL_OUT  = 0x02   # bulk, interface 2
+EP_CTRL_IN   = 0x82
+EP_AUDIO_OUT = 0x03   # isochronous, interface 1
+EP_AUDIO_IN  = 0x83
+
+# ---------------------------------------------------------------------------
+# GIP core command IDs (from xone bus/protocol.c)
+# ---------------------------------------------------------------------------
+
 GIP_CMD_ACKNOWLEDGE   = 0x01
 GIP_CMD_ANNOUNCE      = 0x02
 GIP_CMD_STATUS        = 0x03
 GIP_CMD_IDENTIFY      = 0x04
 GIP_CMD_POWER         = 0x05
+GIP_CMD_AUTHENTICATE  = 0x06
 GIP_CMD_AUDIO_CONTROL = 0x08
 GIP_CMD_INPUT         = 0x20
 GIP_CMD_AUDIO_SAMPLES = 0x60
 
-# GIP option flags
-GIP_OPT_ACKNOWLEDGE = 0x10
-GIP_OPT_INTERNAL    = 0x20
+# GIP option flags (bits in opts byte)
+GIP_OPT_ACK         = 0x10   # request/confirm delivery ACK
+GIP_OPT_INTERNAL    = 0x20   # internal command
+GIP_OPT_CHUNK_START = 0x40   # first chunk of a large packet
+GIP_OPT_CHUNK       = 0x80   # packet is part of a chunked sequence
+
+GIP_CLIENT_ID = 0x01         # our client id (matches device)
+GIP_PKT_MAX_LEN = 58         # max data bytes per interrupt packet
 
 # Audio control subcommands
 GIP_AUD_CTRL_VOLUME_CHAT = 0x00
 GIP_AUD_CTRL_FORMAT      = 0x02
 GIP_AUD_CTRL_VOLUME      = 0x03
 
-# Audio format codes
 GIP_AUD_FORMAT_48KHZ_STEREO = 0x10
 
 TIMEOUT_MS = 500
 
+# ---------------------------------------------------------------------------
+# GIP AUTH constants (from xone auth/auth.h + auth/auth.c)
+# ---------------------------------------------------------------------------
+
+# AUTH context bytes
+AUTH_CTX_HANDSHAKE = 0x00
+AUTH_CTX_CONTROL   = 0x01
+
+# AUTH handshake option flags (different namespace from GIP opts)
+AUTH_OPT_ACK       = 0x01   # device ACK-ing our packet
+AUTH_OPT_REQUEST   = 0x02   # host requesting device to send data
+AUTH_OPT_FROM_HOST = 0x40   # packet originates from host
+
+# AUTH v1 command IDs (RSA-based)
+AUTH_HOST_HELLO    = 0x01
+AUTH_CLIENT_HELLO  = 0x02
+AUTH_CLIENT_CERT   = 0x03
+AUTH_HOST_SECRET   = 0x05
+AUTH_HOST_FINISH   = 0x07
+AUTH_CLIENT_FINISH = 0x08
+
+# AUTH v2 command IDs (ECDH P-256)
+AUTH2_HOST_HELLO    = 0x21
+AUTH2_CLIENT_HELLO  = 0x22
+AUTH2_CLIENT_CERT   = 0x23
+AUTH2_CLIENT_PUBKEY = 0x24
+AUTH2_HOST_PUBKEY   = 0x25
+AUTH2_HOST_FINISH   = 0x26
+AUTH2_CLIENT_FINISH = 0x27
+
+# AUTH sizes
+AUTH_TRAILER_LEN      = 8    # trailing zeros required for v1 host packets
+AUTH_RANDOM_LEN       = 32
+AUTH_CERT_MAX_LEN     = 1024
+AUTH_RSA_PUBKEY_LEN   = 270  # DER SubjectPublicKeyInfo in cert
+AUTH_PMS_LEN          = 48   # premaster secret
+AUTH_ENCRYPTED_PMS_LEN = 256  # RSA 2048-bit output
+AUTH_TRANSCRIPT_LEN   = 32
+AUTH2_PUBKEY_LEN      = 64   # P-256 uncompressed (X+Y, no 04 prefix)
+
+# ASN.1 SEQUENCE marker for RSA public key inside cert (xone: gip_auth_handle_pkt_certificate)
+AUTH_ASN1_SEQ = bytes([0x30, 0x82, 0x01, 0x0a])
 
 # ---------------------------------------------------------------------------
-# GIP packet encoding
+# GIP packet encoding / decoding
 # ---------------------------------------------------------------------------
 
 def encode_varint(value: int) -> bytes:
@@ -66,26 +138,669 @@ def encode_varint(value: int) -> bytes:
     return bytes(result)
 
 
-def build_packet(cmd: int, options: int, seq: int, payload: bytes = b"") -> bytes:
-    length_bytes = encode_varint(len(payload))
-    header = bytes([cmd, options, seq]) + length_bytes
-    if len(header) % 2 != 0:
-        last = length_bytes[-1]
-        length_bytes = length_bytes[:-1] + bytes([last | 0x80, 0x00])
-        header = bytes([cmd, options, seq]) + length_bytes
-    return header + payload
+def decode_gip_header(data: bytes):
+    """Decode GIP wire header.
+    Returns (cmd, opts, seq, hdr_len, pkt_len, chunk_offset) or None.
+    chunk_offset is meaningful only when GIP_OPT_CHUNK is set in opts.
+    """
+    if len(data) < 4:
+        return None
+    cmd, opts, seq = data[0], data[1], data[2]
+    pos = 3
 
+    pkt_len, shift = 0, 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        pkt_len |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            break
+
+    chunk_offset = 0
+    if opts & GIP_OPT_CHUNK:
+        shift = 0
+        while pos < len(data):
+            b = data[pos]; pos += 1
+            chunk_offset |= (b & 0x7F) << shift
+            shift += 7
+            if not (b & 0x80):
+                break
+
+    return (cmd, opts, seq, pos, pkt_len, chunk_offset)
+
+
+def build_gip_header(cmd: int, opts: int, seq: int, pkt_len: int,
+                     chunk_offset: int | None = None) -> bytes:
+    """Build an even-length GIP wire header (with optional chunk_offset)."""
+    len_varint = encode_varint(pkt_len)
+
+    actual = 3 + len(len_varint)
+    if chunk_offset is not None:
+        chunk_varint = encode_varint(chunk_offset)
+        actual += len(chunk_varint)
+    else:
+        chunk_varint = b''
+
+    # Pad header to even length by setting continuation bit on last length byte
+    if actual % 2 != 0:
+        len_varint = len_varint[:-1] + bytes([len_varint[-1] | 0x80, 0x00])
+
+    return bytes([cmd, opts, seq]) + len_varint + chunk_varint
+
+
+def build_packet(cmd: int, options: int, seq: int, payload: bytes = b"") -> bytes:
+    """Build a simple (non-chunked) GIP packet."""
+    return build_gip_header(cmd, options, seq, len(payload)) + payload
+
+
+# ---------------------------------------------------------------------------
+# AUTH packet builders (mirroring xone auth/auth.c)
+# ---------------------------------------------------------------------------
+
+def _auth_hs_hdr(options: int, cmd: int, data_len: int) -> bytes:
+    """6-byte AUTH handshake header."""
+    return bytes([AUTH_CTX_HANDSHAKE, options, 0x00, cmd]) + struct.pack('>H', data_len)
+
+
+def _auth_data_hdr(cmd: int, version: int, payload_len: int) -> bytes:
+    """4-byte AUTH data header."""
+    return bytes([cmd, version]) + struct.pack('>H', payload_len)
+
+
+def _auth_build(cmd: int, version: int, inner: bytes) -> bytes:
+    """Build a host-originated auth payload (hs_hdr + data_hdr + inner + trailer)."""
+    data_hdr  = _auth_data_hdr(cmd, version, len(inner))
+    data_len  = len(data_hdr) + len(inner)          # what hs_hdr.length covers
+    hs_hdr    = _auth_hs_hdr(AUTH_OPT_ACK | AUTH_OPT_FROM_HOST, cmd, data_len)
+    return hs_hdr + data_hdr + inner + bytes(AUTH_TRAILER_LEN)
+
+
+def auth_host_hello_v1(random_host: bytes) -> bytes:
+    """HOST_HELLO v1 auth payload — 58 bytes."""
+    inner = random_host + bytes(8)           # random(32) + unknown1(4) + unknown2(4)
+    return _auth_build(AUTH_HOST_HELLO, 0x01, inner)
+
+
+def auth_host_hello_v2(random_host: bytes) -> bytes:
+    """HOST_HELLO v2 auth payload."""
+    inner = random_host + bytes(4)           # random(32) + unknown(4)
+    return _auth_build(AUTH2_HOST_HELLO, 0x02, inner)
+
+
+def auth_request(cmd: int, expected_payload_len: int) -> bytes:
+    """14-byte request packet — tells device to send its data."""
+    data_len = expected_payload_len + 4      # device data length + data_hdr
+    hs_hdr   = _auth_hs_hdr(AUTH_OPT_REQUEST | AUTH_OPT_FROM_HOST, cmd, data_len)
+    return hs_hdr + bytes(AUTH_TRAILER_LEN)
+
+
+def auth_host_secret_v1(encrypted_pms: bytes) -> bytes:
+    """HOST_SECRET auth payload — 274 bytes, needs chunking."""
+    return _auth_build(AUTH_HOST_SECRET, 0x01, encrypted_pms)
+
+
+def auth_host_pubkey_v2(pubkey: bytes) -> bytes:
+    """HOST_PUBKEY v2 auth payload — 78 bytes."""
+    return _auth_build(AUTH2_HOST_PUBKEY, 0x02, pubkey)
+
+
+def auth_host_finish(cmd: int, transcript_hash: bytes) -> bytes:
+    """HOST_FINISH or HOST_FINISH v2 auth payload — 50 bytes."""
+    version = 0x02 if cmd >= 0x20 else 0x01
+    return _auth_build(cmd, version, transcript_hash)
+
+
+def auth_complete() -> bytes:
+    """AUTH COMPLETE control message — 2 bytes."""
+    return bytes([AUTH_CTX_CONTROL, 0x00])
+
+
+# ---------------------------------------------------------------------------
+# AUTH crypto helpers (mirroring xone auth/crypto.c)
+# ---------------------------------------------------------------------------
+
+def auth_prf(key: bytes, label: str, seed: bytes, length: int) -> bytes:
+    """HMAC-SHA256 based PRF used for master secret and transcript verification."""
+    label_b = label.encode('ascii')
+
+    def h(k, d):
+        return hmac.new(k, d, hashlib.sha256).digest()
+
+    a = h(key, label_b + seed)          # A(1) = HMAC(key, label+seed)
+    out = b''
+    while len(out) < length:
+        out += h(key, a + label_b + seed)
+        a = h(key, a)                   # A(i+1) = HMAC(key, A(i))
+
+    return out[:length]
+
+
+def auth_extract_rsa_pubkey(cert: bytes):
+    """Scan cert for ASN.1 SEQUENCE marker, extract 270-byte DER public key."""
+    idx = cert.find(AUTH_ASN1_SEQ)
+    if idx == -1:
+        return None
+    der = cert[idx:idx + AUTH_RSA_PUBKEY_LEN]
+    if len(der) < AUTH_RSA_PUBKEY_LEN:
+        return None
+    try:
+        return _load_der_pub(der)
+    except Exception as e:
+        print(f"  [auth] pubkey parse error: {e}")
+        return None
+
+
+def auth_rsa_encrypt(pubkey, pms: bytes) -> bytes:
+    """Encrypt premaster secret with device RSA pubkey (PKCS1v15)."""
+    return pubkey.encrypt(pms, _rsa_pad.PKCS1v15())
+
+
+def auth_ecdh_exchange(client_pubkey_bytes: bytes):
+    """Generate host P-256 keypair, compute shared secret.
+    Returns (host_pubkey_bytes: 64, master_secret_seed: 32).
+    """
+    curve = _P256()
+    host_priv = _gen_ec_key(curve, _crypto_backend())
+
+    x = int.from_bytes(client_pubkey_bytes[:32], 'big')
+    y = int.from_bytes(client_pubkey_bytes[32:], 'big')
+    client_pub = _ECPubNums(x, y, curve).public_key(_crypto_backend())
+
+    shared = host_priv.exchange(_ECDH(), client_pub)
+    secret_hash = hashlib.sha256(shared).digest()     # matches xone crypto.c
+
+    nums = host_priv.public_key().public_numbers()
+    host_pub = nums.x.to_bytes(32, 'big') + nums.y.to_bytes(32, 'big')
+    return host_pub, secret_hash
+
+
+# ---------------------------------------------------------------------------
+# Low-level GIP send/receive helpers for auth
+# ---------------------------------------------------------------------------
+
+def _gip_auth_send_simple(dev, auth_payload: bytes, seq: int) -> None:
+    """Send auth payload as a single non-chunked GIP AUTH packet."""
+    opts = GIP_CLIENT_ID | GIP_OPT_INTERNAL | GIP_OPT_ACK
+    pkt  = build_packet(GIP_CMD_AUTHENTICATE, opts, seq, auth_payload)
+    dev.write(EP_GIP_OUT, pkt, timeout=TIMEOUT_MS)
+
+
+def _gip_auth_send_no_ack(dev, auth_payload: bytes, seq: int) -> None:
+    """Send auth payload without requesting GIP ACK (for COMPLETE message)."""
+    opts = GIP_CLIENT_ID | GIP_OPT_INTERNAL
+    pkt  = build_packet(GIP_CMD_AUTHENTICATE, opts, seq, auth_payload)
+    dev.write(EP_GIP_OUT, pkt, timeout=TIMEOUT_MS)
+
+
+def _gip_auth_send_chunked(dev, auth_payload: bytes, seq: int) -> None:
+    """Send a large auth payload in chunks, waiting for device ACK per chunk."""
+    total   = len(auth_payload)
+    base_opts = GIP_CLIENT_ID | GIP_OPT_INTERNAL
+
+    # First chunk: CHUNK_START | CHUNK | ACK, chunk_offset = total length
+    first_opts = base_opts | GIP_OPT_ACK | GIP_OPT_CHUNK_START | GIP_OPT_CHUNK
+    first_hdr  = build_gip_header(GIP_CMD_AUTHENTICATE, first_opts, seq,
+                                  GIP_PKT_MAX_LEN, chunk_offset=total)
+    dev.write(EP_GIP_OUT, first_hdr + auth_payload[:GIP_PKT_MAX_LEN],
+              timeout=TIMEOUT_MS)
+
+    offset    = GIP_PKT_MAX_LEN
+    remaining = total - GIP_PKT_MAX_LEN
+    chunk_opts = base_opts | GIP_OPT_CHUNK   # subsequent chunks
+
+    while remaining > 0:
+        # Wait for device ACK
+        if not _wait_for_gip_ack(dev, cmd=GIP_CMD_AUTHENTICATE, timeout_sec=3.0):
+            print("  [auth] chunked send: ACK timeout")
+            break
+
+        chunk_size = min(remaining, GIP_PKT_MAX_LEN)
+        is_last    = (chunk_size == remaining)
+        co         = chunk_opts | (GIP_OPT_ACK if is_last else 0)
+
+        hdr = build_gip_header(GIP_CMD_AUTHENTICATE, co, seq,
+                               chunk_size, chunk_offset=offset)
+        dev.write(EP_GIP_OUT, hdr + auth_payload[offset:offset + chunk_size],
+                  timeout=TIMEOUT_MS)
+        offset    += chunk_size
+        remaining -= chunk_size
+
+    # Wait for ACK on last chunk
+    _wait_for_gip_ack(dev, cmd=GIP_CMD_AUTHENTICATE, timeout_sec=3.0)
+
+    # Empty chunk signals transfer complete
+    empty_opts = chunk_opts
+    empty_hdr  = build_gip_header(GIP_CMD_AUTHENTICATE, empty_opts, seq,
+                                  0, chunk_offset=total)
+    dev.write(EP_GIP_OUT, empty_hdr, timeout=TIMEOUT_MS)
+
+
+def _wait_for_gip_ack(dev, cmd: int, timeout_sec: float = 2.0) -> bool:
+    """Wait for a GIP-level ACK (cmd=0x01) for the given command."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=200))
+        except usb.core.USBTimeoutError:
+            continue
+        except usb.core.USBError:
+            continue
+
+        if not raw:
+            continue
+        h = decode_gip_header(raw)
+        if not h:
+            continue
+        rcmd, ropts, rseq, hdr_len, pkt_len, _ = h
+
+        if rcmd == GIP_CMD_ACKNOWLEDGE:
+            payload = raw[hdr_len:hdr_len + pkt_len]
+            # payload[1] = command being ACK'd
+            if len(payload) >= 2 and payload[1] == cmd:
+                return True
+        # Other packets (INPUT, STATUS, AUTH…): ignore and keep waiting
+    return False
+
+
+def _send_gip_ack_for_chunk(dev, recv_seq: int, recv_cmd: int,
+                             received_so_far: int, total_len: int) -> None:
+    """Send GIP ACK in response to a received chunk (from device to us)."""
+    remaining = total_len - received_so_far
+    # gip_pkt_acknowledge: unknown(1) + cmd(1) + opts(1) + length_le16 + pad(2) + remaining_le16
+    payload = (bytes([0x00, recv_cmd, GIP_CLIENT_ID | GIP_OPT_INTERNAL]) +
+               struct.pack('<H', received_so_far) +
+               bytes([0x00, 0x00]) +
+               struct.pack('<H', remaining))
+    opts = GIP_CLIENT_ID | GIP_OPT_INTERNAL
+    pkt  = build_packet(GIP_CMD_ACKNOWLEDGE, opts, recv_seq, payload)
+    dev.write(EP_GIP_OUT, pkt, timeout=TIMEOUT_MS)
+
+
+def _recv_auth_pkt(dev, timeout_sec: float = 5.0):
+    """Receive an AUTH payload from the device (handles chunking transparently).
+    Returns (auth_payload: bytes, recv_seq: int) or (None, None) on timeout.
+    """
+    deadline   = time.time() + timeout_sec
+    chunk_buf  = None
+    chunk_total  = 0
+    chunk_recvd  = 0
+    chunk_seq    = 0
+
+    while time.time() < deadline:
+        ms_left = max(50, int((deadline - time.time()) * 1000))
+        try:
+            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=min(ms_left, 300)))
+        except usb.core.USBTimeoutError:
+            continue
+        except usb.core.USBError:
+            continue
+
+        if not raw:
+            continue
+
+        h = decode_gip_header(raw)
+        if not h:
+            continue
+        rcmd, ropts, rseq, hdr_len, pkt_len, chunk_offset = h
+
+        if rcmd == GIP_CMD_STATUS:
+            # Heartbeat — echo back so device stays happy
+            pass  # handled by monitor thread later; ignore here
+        elif rcmd == GIP_CMD_ACKNOWLEDGE:
+            pass  # ignore GIP-level ACKs during recv
+        elif rcmd == GIP_CMD_INPUT:
+            pass  # gamepad input — ignore during auth
+        elif rcmd != GIP_CMD_AUTHENTICATE:
+            pass  # other commands — ignore
+        else:
+            # AUTH packet
+            chunk_data = raw[hdr_len:hdr_len + pkt_len]
+
+            if ropts & GIP_OPT_CHUNK_START:
+                # First chunk: chunk_offset = total expected length
+                chunk_total = chunk_offset
+                chunk_buf   = bytearray(chunk_total)
+                chunk_seq   = rseq
+                chunk_buf[0:pkt_len] = chunk_data
+                chunk_recvd = pkt_len
+                # ACK: chunk_offset was reset to 0 before ACK in xone
+                if ropts & GIP_OPT_ACK:
+                    _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_AUTHENTICATE,
+                                            chunk_recvd, chunk_total)
+
+            elif ropts & GIP_OPT_CHUNK:
+                if chunk_buf is None:
+                    continue  # missed start
+                if pkt_len == 0:
+                    # Empty chunk = transfer complete
+                    return bytes(chunk_buf[:chunk_recvd]), chunk_seq
+                end = chunk_offset + pkt_len
+                chunk_buf[chunk_offset:end] = chunk_data
+                chunk_recvd = end
+                if ropts & GIP_OPT_ACK:
+                    _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_AUTHENTICATE,
+                                            chunk_recvd, chunk_total)
+                if chunk_recvd >= chunk_total:
+                    # All data received (device may or may not send empty chunk)
+                    return bytes(chunk_buf), chunk_seq
+
+            else:
+                # Non-chunked AUTH packet
+                return chunk_data, rseq
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# GIP authentication state machine
+# ---------------------------------------------------------------------------
+
+class _AuthState:
+    def __init__(self):
+        self.v2             = False
+        self.random_host    = os.urandom(AUTH_RANDOM_LEN)
+        self.random_client  = None
+        self.transcript     = hashlib.sha256()
+        self.master_secret  = None
+        self.complete       = False
+        self.last_sent_cmd  = None
+
+    def transcript_sent(self, auth_payload: bytes) -> None:
+        """Update transcript with a host-originated auth payload (skip 6-byte hs_hdr and trailer)."""
+        # data = everything between handshake header and trailer
+        data_len = len(auth_payload) - 6 - AUTH_TRAILER_LEN
+        if data_len > 0:
+            self.transcript.update(auth_payload[6:6 + data_len])
+
+    def transcript_recv(self, auth_payload: bytes) -> None:
+        """Update transcript with a device-originated auth payload (skip 6-byte hs_hdr only)."""
+        if len(auth_payload) > 6:
+            self.transcript.update(auth_payload[6:])
+
+    def get_transcript_hash(self) -> bytes:
+        return self.transcript.copy().digest()
+
+
+def _hexdump(data: bytes, prefix: str = "  ") -> None:
+    for i in range(0, min(len(data), 96), 16):
+        chunk   = data[i:i + 16]
+        hex_p   = " ".join(f"{b:02x}" for b in chunk)
+        asc_p   = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"{prefix}{i:04x}  {hex_p:<48}  {asc_p}")
+
+
+def gip_auth_handshake(dev, seq_ref: list) -> bool:
+    """Perform the full GIP authentication handshake.
+
+    Auth is a custom TLS-like protocol over GIP cmd 0x06:
+      v1 (RSA):  HOST_HELLO → CLIENT_HELLO → CLIENT_CERT → HOST_SECRET → FINISH
+      v2 (ECDH): HOST_HELLO_v2 → CLIENT_HELLO_v2 → CLIENT_CERT_v2 →
+                 CLIENT_PUBKEY_v2 → HOST_PUBKEY_v2 → FINISH
+
+    Returns True if auth completed successfully.
+    """
+    if not _CRYPTO_OK:
+        print("  [auth] skipping auth — cryptography library missing")
+        return False
+
+    state = _AuthState()
+
+    # ------------------------------------------------------------------
+    # STEP A — send HOST_HELLO v1 (device may upgrade to v2)
+    # ------------------------------------------------------------------
+    print("\n[auth] → HOST_HELLO v1")
+    hello_v1 = auth_host_hello_v1(state.random_host)
+    _gip_auth_send_simple(dev, hello_v1, seq_ref[0])
+    seq_ref[0] += 1
+    state.transcript_sent(hello_v1)
+    state.last_sent_cmd = AUTH_HOST_HELLO
+
+    # ------------------------------------------------------------------
+    # STEP B — wait for device AUTH-level ACK (cmd 0x06 with AUTH_OPT_ACK)
+    # ------------------------------------------------------------------
+    auth_ack, ack_seq = _recv_auth_pkt(dev, timeout_sec=4.0)
+    if auth_ack is None:
+        print("  [auth] timeout waiting for AUTH ACK")
+        return False
+
+    print(f"  [auth] ← AUTH response ({len(auth_ack)} bytes):")
+    _hexdump(auth_ack)
+
+    if len(auth_ack) < 6:
+        print("  [auth] response too short")
+        return False
+
+    hs_opts = auth_ack[1]
+    hs_cmd  = auth_ack[3]
+
+    # Check for AUTH v2 upgrade: device sends response where handshake.command != data.command
+    # (xone: gip_auth_process_pkt_data checks `hdr->handshake.command != hdr->data.command`)
+    data_cmd = auth_ack[7] if len(auth_ack) > 7 else hs_cmd
+    if hs_cmd != data_cmd:
+        print("  [auth] device requests AUTH v2 (ECDH) — restarting")
+        state.v2 = True
+        state.transcript = hashlib.sha256()   # reset transcript for v2
+        state.random_host = os.urandom(AUTH_RANDOM_LEN)
+
+        hello_v2 = auth_host_hello_v2(state.random_host)
+        _gip_auth_send_simple(dev, hello_v2, seq_ref[0])
+        seq_ref[0] += 1
+        state.transcript_sent(hello_v2)
+        state.last_sent_cmd = AUTH2_HOST_HELLO
+
+        auth_ack, ack_seq = _recv_auth_pkt(dev, timeout_sec=4.0)
+        if auth_ack is None:
+            print("  [auth] v2: timeout waiting for AUTH ACK")
+            return False
+        hs_opts = auth_ack[1]
+
+    if not (hs_opts & AUTH_OPT_ACK):
+        print("  [auth] expected AUTH-level ACK from device")
+
+    # ------------------------------------------------------------------
+    # STEP C — request CLIENT_HELLO
+    # ------------------------------------------------------------------
+    if state.v2:
+        client_hello_cmd  = AUTH2_CLIENT_HELLO
+        client_hello_size = 32 + 108 + 32   # random + unknown1 + unknown2
+        client_cert_cmd   = AUTH2_CLIENT_CERT
+        client_cert_size  = 768             # gip_auth2_pkt_client_cert
+    else:
+        client_hello_cmd  = AUTH_CLIENT_HELLO
+        client_hello_size = AUTH_RANDOM_LEN + 48
+        client_cert_cmd   = AUTH_CLIENT_CERT
+        client_cert_size  = AUTH_CERT_MAX_LEN
+
+    print(f"\n[auth] → REQUEST CLIENT_HELLO")
+    req = auth_request(client_hello_cmd, client_hello_size)
+    _gip_auth_send_simple(dev, req, seq_ref[0])
+    seq_ref[0] += 1
+
+    # ------------------------------------------------------------------
+    # STEP D — receive CLIENT_HELLO
+    # ------------------------------------------------------------------
+    ch_data, _ = _recv_auth_pkt(dev, timeout_sec=5.0)
+    if ch_data is None:
+        print("  [auth] timeout waiting for CLIENT_HELLO")
+        return False
+    print(f"  [auth] ← CLIENT_HELLO ({len(ch_data)} bytes)")
+
+    # Extract client random from data portion (after 6-byte hs_hdr + 4-byte data_hdr)
+    if len(ch_data) < 10 + AUTH_RANDOM_LEN:
+        print("  [auth] CLIENT_HELLO too short")
+        return False
+    state.random_client = ch_data[10:10 + AUTH_RANDOM_LEN]
+    state.transcript_recv(ch_data)
+    print(f"  [auth] client random: {state.random_client[:8].hex()}…")
+
+    # ------------------------------------------------------------------
+    # STEP E — request CLIENT_CERTIFICATE
+    # ------------------------------------------------------------------
+    print(f"\n[auth] → REQUEST CLIENT_CERTIFICATE")
+    req = auth_request(client_cert_cmd, client_cert_size)
+    _gip_auth_send_simple(dev, req, seq_ref[0])
+    seq_ref[0] += 1
+
+    cert_data, _ = _recv_auth_pkt(dev, timeout_sec=8.0)
+    if cert_data is None:
+        print("  [auth] timeout waiting for CLIENT_CERTIFICATE")
+        return False
+    print(f"  [auth] ← CLIENT_CERTIFICATE ({len(cert_data)} bytes):")
+    _hexdump(cert_data[:64])
+    state.transcript_recv(cert_data)
+
+    # Certificate payload starts at offset 10 (6 hs_hdr + 4 data_hdr)
+    cert_payload = cert_data[10:]
+
+    if state.v2:
+        # ------------------------------------------------------------------
+        # AUTH v2: request CLIENT_PUBKEY (ECDH)
+        # ------------------------------------------------------------------
+        print(f"\n[auth] → REQUEST CLIENT_PUBKEY (v2)")
+        req = auth_request(AUTH2_CLIENT_PUBKEY, AUTH2_PUBKEY_LEN + 64)
+        _gip_auth_send_simple(dev, req, seq_ref[0])
+        seq_ref[0] += 1
+
+        pk_data, _ = _recv_auth_pkt(dev, timeout_sec=5.0)
+        if pk_data is None:
+            print("  [auth] v2: timeout waiting for CLIENT_PUBKEY")
+            return False
+        print(f"  [auth] ← CLIENT_PUBKEY v2 ({len(pk_data)} bytes)")
+        state.transcript_recv(pk_data)
+
+        client_pubkey_bytes = pk_data[10:10 + AUTH2_PUBKEY_LEN]
+
+        print(f"\n[auth] computing ECDH P-256 key exchange…")
+        host_pubkey, ecdh_secret = auth_ecdh_exchange(client_pubkey_bytes)
+
+        rand_seed = state.random_host + state.random_client
+        state.master_secret = auth_prf(ecdh_secret, "Master Secret",
+                                       rand_seed, AUTH_PMS_LEN)
+        print(f"  [auth] master secret computed (v2 ECDH)")
+
+        # Send HOST_PUBKEY v2
+        print(f"\n[auth] → HOST_PUBKEY v2")
+        hpk_pkt = auth_host_pubkey_v2(host_pubkey)
+        _gip_auth_send_simple(dev, hpk_pkt, seq_ref[0])
+        seq_ref[0] += 1
+        state.transcript_sent(hpk_pkt)
+        state.last_sent_cmd = AUTH2_HOST_PUBKEY
+
+        # Wait for ACK
+        ack2, _ = _recv_auth_pkt(dev, timeout_sec=4.0)
+        if ack2:
+            print(f"  [auth] ← ACK for HOST_PUBKEY")
+
+        finish_cmd        = AUTH2_HOST_FINISH
+        client_finish_cmd = AUTH2_CLIENT_FINISH
+
+    else:
+        # ------------------------------------------------------------------
+        # AUTH v1: RSA encrypt premaster secret
+        # ------------------------------------------------------------------
+        print(f"\n[auth] extracting RSA public key from certificate…")
+        pubkey = auth_extract_rsa_pubkey(cert_payload)
+        if pubkey is None:
+            print("  [auth] ERROR: RSA pubkey not found in certificate")
+            return False
+        print(f"  [auth] RSA pubkey found ({pubkey.key_size} bit)")
+
+        pms = os.urandom(AUTH_PMS_LEN)
+        encrypted_pms = auth_rsa_encrypt(pubkey, pms)
+        print(f"  [auth] PMS encrypted ({len(encrypted_pms)} bytes)")
+
+        rand_seed = state.random_host + state.random_client
+        state.master_secret = auth_prf(pms, "Master Secret", rand_seed, AUTH_PMS_LEN)
+        print(f"  [auth] master secret computed (v1 RSA)")
+
+        # Send HOST_SECRET (274 bytes, needs chunking)
+        print(f"\n[auth] → HOST_SECRET (chunked)")
+        secret_pkt = auth_host_secret_v1(encrypted_pms)
+        _gip_auth_send_chunked(dev, secret_pkt, seq_ref[0])
+        seq_ref[0] += 1
+        state.transcript_sent(secret_pkt)
+        state.last_sent_cmd = AUTH_HOST_SECRET
+
+        # Wait for AUTH-level ACK on HOST_SECRET
+        ack2, _ = _recv_auth_pkt(dev, timeout_sec=4.0)
+        if ack2:
+            print(f"  [auth] ← ACK for HOST_SECRET")
+
+        finish_cmd        = AUTH_HOST_FINISH
+        client_finish_cmd = AUTH_CLIENT_FINISH
+
+    # ------------------------------------------------------------------
+    # STEP F — HOST_FINISH
+    # ------------------------------------------------------------------
+    print(f"\n[auth] → HOST_FINISH")
+    transcript_hash = state.get_transcript_hash()
+    finish_transcript = auth_prf(state.master_secret, "Host Finished",
+                                 transcript_hash, AUTH_TRANSCRIPT_LEN)
+    finish_pkt = auth_host_finish(finish_cmd, finish_transcript)
+    _gip_auth_send_simple(dev, finish_pkt, seq_ref[0])
+    seq_ref[0] += 1
+    state.transcript_sent(finish_pkt)
+
+    # Wait for ACK
+    ack3, _ = _recv_auth_pkt(dev, timeout_sec=4.0)
+    if ack3:
+        print(f"  [auth] ← ACK for HOST_FINISH")
+
+    # ------------------------------------------------------------------
+    # STEP G — request and verify CLIENT_FINISH
+    # ------------------------------------------------------------------
+    print(f"\n[auth] → REQUEST CLIENT_FINISH")
+    req = auth_request(client_finish_cmd, AUTH_TRANSCRIPT_LEN + 32)
+    _gip_auth_send_simple(dev, req, seq_ref[0])
+    seq_ref[0] += 1
+
+    cf_data, _ = _recv_auth_pkt(dev, timeout_sec=5.0)
+    if cf_data is None:
+        print("  [auth] timeout waiting for CLIENT_FINISH")
+        return False
+    print(f"  [auth] ← CLIENT_FINISH ({len(cf_data)} bytes)")
+
+    # Verify transcript: compute expected "Device Finished" using transcript AFTER HOST_FINISH
+    transcript_hash2 = state.get_transcript_hash()   # now includes HOST_FINISH
+    expected_finish = auth_prf(state.master_secret, "Device Finished",
+                               transcript_hash2, AUTH_TRANSCRIPT_LEN)
+    client_transcript = cf_data[10:10 + AUTH_TRANSCRIPT_LEN]  # after hs+data headers
+
+    if client_transcript == expected_finish:
+        print("  [auth] ✓ CLIENT_FINISH transcript verified!")
+    else:
+        print("  [auth] ✗ CLIENT_FINISH transcript MISMATCH — auth may still work")
+        print(f"    expected: {expected_finish.hex()}")
+        print(f"    received: {client_transcript.hex()}")
+
+    # ------------------------------------------------------------------
+    # STEP H — AUTH COMPLETE control message
+    # ------------------------------------------------------------------
+    print(f"\n[auth] → AUTH COMPLETE")
+    complete_pkt = auth_complete()
+    _gip_auth_send_no_ack(dev, complete_pkt, seq_ref[0])
+    seq_ref[0] += 1
+
+    state.complete = True
+    print("  [auth] ✓ Handshake complete!")
+    time.sleep(0.1)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Existing GIP packet helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def pkt_identify(seq: int) -> bytes:
-    return build_packet(GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, seq)
+    return build_packet(GIP_CMD_IDENTIFY, GIP_CLIENT_ID | GIP_OPT_INTERNAL, seq)
 
 
 def pkt_status(seq: int, status: int = 0x80) -> bytes:
-    return build_packet(GIP_CMD_STATUS, GIP_OPT_INTERNAL, seq,
+    return build_packet(GIP_CMD_STATUS, GIP_CLIENT_ID | GIP_OPT_INTERNAL, seq,
                         bytes([status, 0x00, 0x00, 0x00]))
 
 
-AUD_CLIENT = 0x01  # audio subsystem uses client_id=1 (opts bit 0)
+AUD_CLIENT = 0x01
 
 def pkt_audio_format(seq: int) -> bytes:
     payload = bytes([GIP_AUD_CTRL_FORMAT,
@@ -101,7 +816,6 @@ def pkt_audio_volume(seq: int, out_vol: int = 100, in_vol: int = 100) -> bytes:
 
 def pkt_audio_volume_chat(seq: int, state: int = 0x04,
                           v1: int = 25, v2: int = 25, v3: int = 100) -> bytes:
-    """Mirror the device's own volume_chat format (subcommand 0x00)."""
     payload = bytes([GIP_AUD_CTRL_VOLUME_CHAT, state, v1, v2, v3])
     return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL | AUD_CLIENT, seq, payload)
 
@@ -117,10 +831,10 @@ def pkt_ack(ack_cmd: int, ack_opts: int, ack_seq: int) -> bytes:
 
 def hexdump(data: bytes, prefix: str = "  ") -> None:
     for i in range(0, len(data), 16):
-        chunk = data[i:i + 16]
-        hex_part = " ".join(f"{b:02x}" for b in chunk)
-        asc_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-        print(f"{prefix}{i:04x}  {hex_part:<48}  {asc_part}")
+        chunk   = data[i:i + 16]
+        hex_p   = " ".join(f"{b:02x}" for b in chunk)
+        asc_p   = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"{prefix}{i:04x}  {hex_p:<48}  {asc_p}")
 
 
 def gip_send(dev, data: bytes, label: str) -> bool:
@@ -152,14 +866,6 @@ def gip_recv(dev, label: str) -> bytes | None:
 # uinput gamepad forwarding
 # ---------------------------------------------------------------------------
 
-# uinput constants
-UINPUT_PATH = "/dev/uinput"
-UI_SET_EVBIT   = 0x40045564
-UI_SET_KEYBIT  = 0x40045565
-UI_SET_ABSBIT  = 0x40045567
-UI_DEV_CREATE  = 0x5501
-UI_DEV_DESTROY = 0x5502
-
 def create_uinput_gamepad() -> UInput:
     return UInput(
         events={
@@ -188,14 +894,20 @@ def create_uinput_gamepad() -> UInput:
 
 
 def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
-    """Parse a GIP_CMD_INPUT (0x20) packet and forward via uinput."""
     if len(data) < 4 + 12:
         return
     payload = data[4:]
     buttons = struct.unpack_from("<H", payload, 0)[0]
-    lt, rt = payload[2], payload[3]
-    lx, ly = struct.unpack_from("<hh", payload, 4)
-    rx, ry = struct.unpack_from("<hh", payload, 8)
+    lt, rt  = payload[2], payload[3]
+    lx, ly  = struct.unpack_from("<hh", payload, 4)
+    rx, ry  = struct.unpack_from("<hh", payload, 8)
+
+    # Log extra bytes that might be media buttons
+    if len(payload) >= 14:
+        extra = payload[12:14]
+        if any(extra):
+            ts = time.strftime("%H:%M:%S")
+            print(f"\n[input {ts}] EXTRA bytes 12-13: {extra.hex()} (media buttons?)")
 
     btn_map = [
         (0x0001, ecodes.BTN_SELECT), (0x0002, ecodes.BTN_MODE),
@@ -221,33 +933,48 @@ def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
 # GIP init sequence
 # ---------------------------------------------------------------------------
 
-def gip_init(dev) -> None:
-    seq = 1
+def gip_init(dev) -> list:
+    """Run GIP init: IDENTIFY → AUTH → AUDIO FORMAT → VOLUME.
+    Returns seq_ref list for use by monitor threads.
+    """
+    seq_ref = [1]
 
     print("\n" + "=" * 60)
-    print("STEP 1 — IDENTIFY (discover supported audio formats)")
+    print("STEP 1 — IDENTIFY")
     print("=" * 60)
-    gip_send(dev, pkt_identify(seq), "IDENTIFY")
-    resp = gip_recv(dev, "IDENTIFY response")
-    if resp and resp[0] == GIP_CMD_IDENTIFY:
-        print("  ✓ Device acknowledged IDENTIFY")
-        if resp[0] & GIP_OPT_ACKNOWLEDGE:
-            dev.write(EP_GIP_OUT, pkt_ack(resp[0], resp[1], resp[2]), timeout=TIMEOUT_MS)
-    seq += 1
-    time.sleep(0.05)
+    gip_send(dev, pkt_identify(seq_ref[0]), "IDENTIFY")
+    seq_ref[0] += 1
+    # Drain any pending packets (device may send chunked IDENTIFY response)
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        try:
+            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=100))
+            if raw:
+                h = decode_gip_header(raw)
+                if h:
+                    print(f"  ← cmd=0x{h[0]:02x} ({len(raw)}B)")
+                    # ACK chunked responses from device
+                    if h[1] & GIP_OPT_CHUNK and h[1] & GIP_OPT_ACK:
+                        _send_gip_ack_for_chunk(dev, h[2], h[0], 0, 0)
+        except usb.core.USBTimeoutError:
+            break
+        except usb.core.USBError:
+            break
 
     print("\n" + "=" * 60)
-    print("STEP 2 — STATUS (host ready)")
+    print("STEP 2 — GIP AUTH HANDSHAKE")
     print("=" * 60)
-    gip_send(dev, pkt_status(seq), "STATUS")
-    resp = gip_recv(dev, "STATUS response")
-    seq += 1
-    time.sleep(0.05)
+    auth_ok = gip_auth_handshake(dev, seq_ref)
+    if not auth_ok:
+        print("  WARNING: auth failed or skipped — audio may not work")
+
+    time.sleep(0.15)
 
     print("\n" + "=" * 60)
     print("STEP 3 — AUDIO FORMAT (48kHz stereo)")
     print("=" * 60)
-    gip_send(dev, pkt_audio_format(seq), "AUDIO_FORMAT")
+    gip_send(dev, pkt_audio_format(seq_ref[0]), "AUDIO_FORMAT")
+    seq_ref[0] += 1
     resp = gip_recv(dev, "AUDIO_FORMAT response")
     if resp:
         if resp[0] == GIP_CMD_AUDIO_CONTROL:
@@ -255,24 +982,25 @@ def gip_init(dev) -> None:
             print(f"  ✓ Audio control response, subcommand: 0x{sub:02x}")
         elif resp[0] == GIP_CMD_ACKNOWLEDGE:
             print("  ✓ ACK")
-    seq += 1
     time.sleep(0.05)
 
     print("\n" + "=" * 60)
     print("STEP 4 — VOLUME (unmute, 100%)")
     print("=" * 60)
-    gip_send(dev, pkt_audio_volume(seq), "VOLUME")
-    resp = gip_recv(dev, "VOLUME response")
-    seq += 1
+    gip_send(dev, pkt_audio_volume(seq_ref[0]), "VOLUME")
+    seq_ref[0] += 1
+    gip_recv(dev, "VOLUME response")
     time.sleep(0.05)
 
     print("\n" + "=" * 60)
-    print("STEP 4 — VOLUME_CHAT (unmute, announce audio ready)")
+    print("STEP 5 — VOLUME_CHAT")
     print("=" * 60)
-    gip_send(dev, pkt_audio_volume_chat(seq), "VOLUME_CHAT")
-    resp = gip_recv(dev, "VOLUME_CHAT response")
-    seq += 1
+    gip_send(dev, pkt_audio_volume_chat(seq_ref[0]), "VOLUME_CHAT")
+    seq_ref[0] += 1
+    gip_recv(dev, "VOLUME_CHAT response")
     time.sleep(0.05)
+
+    return seq_ref
 
 
 # ---------------------------------------------------------------------------
@@ -280,14 +1008,13 @@ def gip_init(dev) -> None:
 # ---------------------------------------------------------------------------
 
 def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) -> None:
-    """Read EP1 IN — handle GIP messages: forward gamepad, log audio/media."""
     print("[gip] Monitoring EP1 IN...")
     while not stop.is_set():
         try:
             data = bytes(dev.read(EP_GIP_IN, 64, timeout=100))
             if not data:
                 continue
-            cmd = data[0]
+            cmd  = data[0]
             opts = data[1] if len(data) > 1 else 0
             seq  = data[2] if len(data) > 2 else 0
 
@@ -295,7 +1022,6 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
                 if ui is not None:
                     parse_and_forward_gamepad(ui, data)
             elif cmd == GIP_CMD_STATUS:
-                # Device heartbeat — mirror it back so device knows host is alive
                 s = seq_ref[0]; seq_ref[0] += 1
                 try:
                     status_val = data[4] if len(data) > 4 else 0x80
@@ -304,27 +1030,28 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
                     pass
             elif cmd == GIP_CMD_AUDIO_CONTROL:
                 sub = data[4] if len(data) > 4 else 0xFF
-                ts = time.strftime("%H:%M:%S")
+                ts  = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] AUDIO_CONTROL subcommand=0x{sub:02x}:")
                 hexdump(data)
-                # Device sends its volume state — echo back with max volumes
                 if sub == 0x00 and len(data) >= 9:
-                    state = data[5]
-                    # Boost to max (0x64=100) regardless of what device reported
+                    state_b = data[5]
                     s = seq_ref[0]; seq_ref[0] += 1
                     try:
                         dev.write(EP_GIP_OUT,
-                                  pkt_audio_volume_chat(s, state, 0x64, 0x64, 0x64),
+                                  pkt_audio_volume_chat(s, state_b, 0x64, 0x64, 0x64),
                                   timeout=TIMEOUT_MS)
-                        print(f"  → sent VOLUME_CHAT max volumes (seq={s}, state=0x{state:02x})")
+                        print(f"  → sent VOLUME_CHAT max volumes")
                     except usb.core.USBError as e:
                         print(f"  → VOLUME_CHAT send failed: {e}")
-                # ACK if requested
-                if opts & GIP_OPT_ACKNOWLEDGE:
+                if opts & GIP_OPT_ACK:
                     try:
                         dev.write(EP_GIP_OUT, pkt_ack(cmd, opts, seq), timeout=TIMEOUT_MS)
                     except usb.core.USBError:
                         pass
+            elif cmd == GIP_CMD_AUTHENTICATE:
+                ts = time.strftime("%H:%M:%S")
+                print(f"\n[gip {ts}] AUTHENTICATE ({len(data)}B) — unexpected post-auth:")
+                hexdump(data)
             else:
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] cmd=0x{cmd:02x} ({len(data)} bytes):")
@@ -338,7 +1065,6 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
 
 
 def monitor_ctrl(dev, stop: threading.Event) -> None:
-    """Read EP2 IN — secondary channel, media buttons hypothesis."""
     print("[ctrl] Monitoring EP2 IN (bulk)...")
     while not stop.is_set():
         try:
@@ -357,40 +1083,33 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
 
 def _gen_tone(freq: int = 440, sample_rate: int = 48000,
               channels: int = 2, duration_ms: int = 1) -> bytes:
-    """Generate one ms of a sine wave tone as signed 16-bit PCM."""
     import math
     n_samples = sample_rate * duration_ms // 1000
     out = []
     for i in range(n_samples):
         val = int(32767 * 0.3 * math.sin(2 * math.pi * freq * i / sample_rate))
-        packed = struct.pack("<h", val)
-        out.append(packed * channels)
+        out.append(struct.pack("<h", val) * channels)
     return b"".join(out)
 
 
 def stream_audio_out(dev, stop: threading.Event) -> None:
-    """Send audio on EP3 OUT. Starts with a 440Hz tone to verify headphone
-    output and potentially trigger the mic input path, then switches to silence."""
     tone    = struct.pack("<H", 192) + _gen_tone(440, 48000, 2, 1)[:192]
     silence = struct.pack("<H", 192) + bytes(192)
 
-    tone_duration = 5.0  # seconds of tone at startup
-    start = time.time()
-    sent = 0
-    errors = 0
+    tone_duration = 5.0
+    start    = time.time()
+    sent     = 0
+    errors   = 0
     last_log = time.time()
-    playing_tone = True
-    print(f"[audio-out] Playing 440Hz tone for {tone_duration:.0f}s on EP3 OUT "
-          f"(should hear in headphones)...")
+    print(f"[audio-out] Playing 440Hz tone for {tone_duration:.0f}s on EP3 OUT…")
 
     while not stop.is_set():
-        now = time.time()
+        now          = time.time()
         playing_tone = (now - start) < tone_duration
-        packet = tone if playing_tone else silence
-
+        packet       = tone if playing_tone else silence
         try:
             dev.write(EP_AUDIO_OUT, packet, timeout=5)
-            sent += 1
+            sent  += 1
             errors = 0
         except usb.core.USBTimeoutError:
             pass
@@ -408,19 +1127,18 @@ def stream_audio_out(dev, stop: threading.Event) -> None:
         if now - last_log >= 5.0:
             label = "tone" if playing_tone else "silence"
             print(f"[audio-out] {sent} packets/5s ({sent/5:.0f}/s) — {label}")
-            sent = 0
+            sent     = 0
             last_log = now
 
 
 def monitor_audio(dev, stop: threading.Event) -> None:
-    """Read EP3 IN — isochronous mic stream."""
     print("[audio-in]  Monitoring EP3 IN (isochronous mic)...")
-    count = 0
-    reads = 0
-    last_debug = time.time()
+    count    = 0
+    reads    = 0
+    last_dbg = time.time()
     while not stop.is_set():
         try:
-            raw = dev.read(EP_AUDIO_IN, 228, timeout=100)
+            raw  = dev.read(EP_AUDIO_IN, 228, timeout=100)
             data = bytes(raw)
             reads += 1
             if data and any(data):
@@ -439,11 +1157,10 @@ def monitor_audio(dev, stop: threading.Event) -> None:
             time.sleep(0.1)
 
         now = time.time()
-        if now - last_debug >= 5.0:
-            print(f"[audio-in] debug: {reads} reads in 5s — "
-                  f"{count} non-silent packets total")
-            reads = 0
-            last_debug = now
+        if now - last_dbg >= 5.0:
+            print(f"[audio-in] {reads} reads in 5s — {count} non-silent total")
+            reads    = 0
+            last_dbg = now
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +1172,7 @@ def main():
         print("ERROR: run as root (sudo)")
         sys.exit(1)
 
-    print("=== Razer Wolverine Ultimate — GIP Audio Init ===\n")
+    print("=== Razer Wolverine Ultimate — GIP Driver with Auth ===\n")
 
     dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
     if dev is None:
@@ -482,26 +1199,23 @@ def main():
         print(f"  WARNING: uinput failed ({e}) — gamepad forwarding disabled")
         uinput_fd = None
 
-    stop = threading.Event()
-    seq_ref = [10]
+    # GIP init (IDENTIFY + AUTH + AUDIO FORMAT)
+    # Auth and audio format negotiation happen with alt=0 (isochronous endpoints idle).
+    seq_ref = gip_init(dev)
 
-    # GIP init with interfaces in alt=0 (no isochronous endpoints yet).
-    # Standard USB audio: negotiate format first, then activate alt=1.
-    print("\nRunning GIP init (isochronous endpoints still idle)...")
-    gip_init(dev)
-
-    # NOW activate alt=1 — isochronous endpoints come alive after format is agreed.
+    # Activate alt=1 — isochronous endpoints come alive after format negotiation
     print("\nActivating isochronous endpoints (alt setting 1)...")
     for iface in [1, 2]:
         try:
             dev.set_interface_altsetting(interface=iface, alternate_setting=1)
-            print(f"  Interface {iface} alt setting 1 active")
+            print(f"  Interface {iface} alt=1 active")
         except usb.core.USBError as e:
             print(f"  Interface {iface} alt setting: {e}")
 
     time.sleep(0.1)
 
-    # Start audio streams after alt=1 is live
+    stop = threading.Event()
+
     print("Starting EP3 audio streams...")
     t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True)
     t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop), daemon=True)
