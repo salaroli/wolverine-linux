@@ -80,6 +80,11 @@ def pkt_identify(seq: int) -> bytes:
     return build_packet(GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, seq)
 
 
+def pkt_status(seq: int, status: int = 0x80) -> bytes:
+    return build_packet(GIP_CMD_STATUS, GIP_OPT_INTERNAL, seq,
+                        bytes([status, 0x00, 0x00, 0x00]))
+
+
 AUD_CLIENT = 0x01  # audio subsystem uses client_id=1 (opts bit 0)
 
 def pkt_audio_format(seq: int) -> bytes:
@@ -232,7 +237,15 @@ def gip_init(dev) -> None:
     time.sleep(0.05)
 
     print("\n" + "=" * 60)
-    print("STEP 2 — AUDIO FORMAT (48kHz stereo)")
+    print("STEP 2 — STATUS (host ready)")
+    print("=" * 60)
+    gip_send(dev, pkt_status(seq), "STATUS")
+    resp = gip_recv(dev, "STATUS response")
+    seq += 1
+    time.sleep(0.05)
+
+    print("\n" + "=" * 60)
+    print("STEP 3 — AUDIO FORMAT (48kHz stereo)")
     print("=" * 60)
     gip_send(dev, pkt_audio_format(seq), "AUDIO_FORMAT")
     resp = gip_recv(dev, "AUDIO_FORMAT response")
@@ -246,7 +259,7 @@ def gip_init(dev) -> None:
     time.sleep(0.05)
 
     print("\n" + "=" * 60)
-    print("STEP 3 — VOLUME (unmute, 100%)")
+    print("STEP 4 — VOLUME (unmute, 100%)")
     print("=" * 60)
     gip_send(dev, pkt_audio_volume(seq), "VOLUME")
     resp = gip_recv(dev, "VOLUME response")
@@ -281,6 +294,14 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
             if cmd == GIP_CMD_INPUT:
                 if ui is not None:
                     parse_and_forward_gamepad(ui, data)
+            elif cmd == GIP_CMD_STATUS:
+                # Device heartbeat — mirror it back so device knows host is alive
+                s = seq_ref[0]; seq_ref[0] += 1
+                try:
+                    status_val = data[4] if len(data) > 4 else 0x80
+                    dev.write(EP_GIP_OUT, pkt_status(s, status_val), timeout=TIMEOUT_MS)
+                except usb.core.USBError:
+                    pass
             elif cmd == GIP_CMD_AUDIO_CONTROL:
                 sub = data[4] if len(data) > 4 else 0xFF
                 ts = time.strftime("%H:%M:%S")
