@@ -15,6 +15,7 @@ import struct
 import threading
 import usb.core
 import usb.util
+from evdev import UInput, AbsInfo, ecodes
 
 VENDOR_ID  = 0x1532
 PRODUCT_ID = 0x0a14
@@ -144,77 +145,35 @@ UI_SET_ABSBIT  = 0x40045567
 UI_DEV_CREATE  = 0x5501
 UI_DEV_DESTROY = 0x5502
 
-EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
-ABS_X, ABS_Y, ABS_Z = 0, 1, 2
-ABS_RX, ABS_RY, ABS_RZ = 3, 4, 5
-ABS_HAT0X, ABS_HAT0Y = 16, 17
-
-BTN_A, BTN_B, BTN_X, BTN_Y = 304, 305, 307, 308
-BTN_TL, BTN_TR = 310, 311
-BTN_SELECT, BTN_START, BTN_MODE = 314, 315, 316
-BTN_THUMBL, BTN_THUMBR = 317, 318
-
-GAMEPAD_BUTTONS = [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR,
-                   BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR]
-GAMEPAD_AXES = [ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X, ABS_HAT0Y]
-
-
-def create_uinput_gamepad():
-    """Create a virtual Xbox gamepad via uinput."""
-    import fcntl, ctypes
-
-    fd = open(UINPUT_PATH, "wb")
-
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    for btn in GAMEPAD_BUTTONS:
-        fcntl.ioctl(fd, UI_SET_KEYBIT, btn)
-
-    fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
-    for ax in GAMEPAD_AXES:
-        fcntl.ioctl(fd, UI_SET_ABSBIT, ax)
-
-    # uinput_setup struct: input_id (4×u16) + name (80 bytes) + ff_effects_max (u32)
-    input_id = struct.pack("HHHH", 0x03, VENDOR_ID, PRODUCT_ID, 0x0101)
-    name = b"Razer Wolverine Ultimate\x00" + b"\x00" * 56
-    uinput_setup = input_id + name + struct.pack("I", 0)
-
-    # uinput_abs_setup for each axis: code(u16) + pad(u16) + input_absinfo(6×i32)
-    ABS_SETUP = 0x401853C0  # _IOW('U', 0xC0, struct uinput_abs_setup)
-    for ax in [ABS_X, ABS_Y, ABS_RX, ABS_RY]:
-        abs_setup = struct.pack("HHiiiiii", ax, 0, 0, -32768, 32767, 16, 128, 0)
-        fcntl.ioctl(fd, ABS_SETUP, abs_setup)
-    for ax in [ABS_Z, ABS_RZ]:
-        abs_setup = struct.pack("HHiiiiii", ax, 0, 0, 0, 255, 0, 0, 0)
-        fcntl.ioctl(fd, ABS_SETUP, abs_setup)
-    for ax in [ABS_HAT0X, ABS_HAT0Y]:
-        abs_setup = struct.pack("HHiiiiii", ax, 0, 0, -1, 1, 0, 0, 0)
-        fcntl.ioctl(fd, ABS_SETUP, abs_setup)
-
-    # UI_DEV_SETUP
-    UI_DEV_SETUP = 0x405c5503
-    fcntl.ioctl(fd, UI_DEV_SETUP, uinput_setup)
-    fcntl.ioctl(fd, UI_DEV_CREATE)
-    return fd
+def create_uinput_gamepad() -> UInput:
+    return UInput(
+        events={
+            ecodes.EV_KEY: [
+                ecodes.BTN_A, ecodes.BTN_B, ecodes.BTN_X, ecodes.BTN_Y,
+                ecodes.BTN_TL, ecodes.BTN_TR,
+                ecodes.BTN_SELECT, ecodes.BTN_START, ecodes.BTN_MODE,
+                ecodes.BTN_THUMBL, ecodes.BTN_THUMBR,
+            ],
+            ecodes.EV_ABS: [
+                (ecodes.ABS_X,     AbsInfo(0, -32768, 32767, 16, 128, 0)),
+                (ecodes.ABS_Y,     AbsInfo(0, -32768, 32767, 16, 128, 0)),
+                (ecodes.ABS_Z,     AbsInfo(0, 0, 255, 0, 0, 0)),
+                (ecodes.ABS_RX,    AbsInfo(0, -32768, 32767, 16, 128, 0)),
+                (ecodes.ABS_RY,    AbsInfo(0, -32768, 32767, 16, 128, 0)),
+                (ecodes.ABS_RZ,    AbsInfo(0, 0, 255, 0, 0, 0)),
+                (ecodes.ABS_HAT0X, AbsInfo(0, -1, 1, 0, 0, 0)),
+                (ecodes.ABS_HAT0Y, AbsInfo(0, -1, 1, 0, 0, 0)),
+            ],
+        },
+        name="Razer Wolverine Ultimate",
+        vendor=VENDOR_ID,
+        product=PRODUCT_ID,
+        version=0x0101,
+    )
 
 
-def emit_event(fd, ev_type: int, code: int, value: int) -> None:
-    # struct input_event: timeval(2×i64) + type(u16) + code(u16) + value(i32)
-    t = time.time()
-    sec = int(t)
-    usec = int((t - sec) * 1_000_000)
-    fd.write(struct.pack("qqHHi", sec, usec, ev_type, code, value))
-
-
-def parse_and_forward_gamepad(fd, data: bytes) -> None:
+def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
     """Parse a GIP_CMD_INPUT (0x20) packet and forward via uinput."""
-    # xpad/GIP input report layout (after 4-byte header):
-    # bytes 0-1: buttons bitmask
-    # byte  2:   left trigger
-    # byte  3:   right trigger
-    # bytes 4-5: left stick X (i16 LE)
-    # bytes 6-7: left stick Y (i16 LE)
-    # bytes 8-9: right stick X
-    # bytes 10-11: right stick Y
     if len(data) < 4 + 12:
         return
     payload = data[4:]
@@ -224,22 +183,23 @@ def parse_and_forward_gamepad(fd, data: bytes) -> None:
     rx, ry = struct.unpack_from("<hh", payload, 8)
 
     btn_map = [
-        (0x0001, BTN_SELECT), (0x0002, BTN_MODE),  (0x0004, BTN_START),
-        (0x0008, BTN_A),      (0x0010, BTN_B),     (0x0020, BTN_X),
-        (0x0040, BTN_Y),      (0x0100, BTN_TL),    (0x0200, BTN_TR),
-        (0x1000, BTN_THUMBL), (0x2000, BTN_THUMBR),
+        (0x0001, ecodes.BTN_SELECT), (0x0002, ecodes.BTN_MODE),
+        (0x0004, ecodes.BTN_START),  (0x0008, ecodes.BTN_A),
+        (0x0010, ecodes.BTN_B),      (0x0020, ecodes.BTN_X),
+        (0x0040, ecodes.BTN_Y),      (0x0100, ecodes.BTN_TL),
+        (0x0200, ecodes.BTN_TR),     (0x1000, ecodes.BTN_THUMBL),
+        (0x2000, ecodes.BTN_THUMBR),
     ]
     for mask, btn in btn_map:
-        emit_event(fd, EV_KEY, btn, 1 if (buttons & mask) else 0)
+        ui.write(ecodes.EV_KEY, btn, 1 if (buttons & mask) else 0)
 
-    emit_event(fd, EV_ABS, ABS_X,  lx)
-    emit_event(fd, EV_ABS, ABS_Y,  ly)
-    emit_event(fd, EV_ABS, ABS_Z,  lt)
-    emit_event(fd, EV_ABS, ABS_RX, rx)
-    emit_event(fd, EV_ABS, ABS_RY, ry)
-    emit_event(fd, EV_ABS, ABS_RZ, rt)
-    emit_event(fd, EV_SYN, 0, 0)
-    fd.flush()
+    ui.write(ecodes.EV_ABS, ecodes.ABS_X,     lx)
+    ui.write(ecodes.EV_ABS, ecodes.ABS_Y,     ly)
+    ui.write(ecodes.EV_ABS, ecodes.ABS_Z,     lt)
+    ui.write(ecodes.EV_ABS, ecodes.ABS_RX,    rx)
+    ui.write(ecodes.EV_ABS, ecodes.ABS_RY,    ry)
+    ui.write(ecodes.EV_ABS, ecodes.ABS_RZ,    rt)
+    ui.syn()
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +248,7 @@ def gip_init(dev) -> None:
 # Monitor threads
 # ---------------------------------------------------------------------------
 
-def monitor_gip(dev, uinput_fd, stop: threading.Event) -> None:
+def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) -> None:
     """Read EP1 IN — handle GIP messages: forward gamepad, log audio/media."""
     print("[gip] Monitoring EP1 IN...")
     while not stop.is_set():
@@ -297,13 +257,32 @@ def monitor_gip(dev, uinput_fd, stop: threading.Event) -> None:
             if not data:
                 continue
             cmd = data[0]
+            opts = data[1] if len(data) > 1 else 0
+            seq  = data[2] if len(data) > 2 else 0
+
             if cmd == GIP_CMD_INPUT:
-                parse_and_forward_gamepad(uinput_fd, data)
+                if ui is not None:
+                    parse_and_forward_gamepad(ui, data)
             elif cmd == GIP_CMD_AUDIO_CONTROL:
                 sub = data[4] if len(data) > 4 else 0xFF
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] AUDIO_CONTROL subcommand=0x{sub:02x}:")
                 hexdump(data)
+                # Device is telling us its audio state — reply with our volume
+                if sub == 0x00:
+                    s = seq_ref[0]
+                    seq_ref[0] += 1
+                    try:
+                        dev.write(EP_GIP_OUT, pkt_audio_volume(s), timeout=TIMEOUT_MS)
+                        print(f"  → sent VOLUME in response (seq={s})")
+                    except usb.core.USBError as e:
+                        print(f"  → VOLUME send failed: {e}")
+                # ACK if requested
+                if opts & GIP_OPT_ACKNOWLEDGE:
+                    try:
+                        dev.write(EP_GIP_OUT, pkt_ack(cmd, opts, seq), timeout=TIMEOUT_MS)
+                    except usb.core.USBError:
+                        pass
             else:
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] cmd=0x{cmd:02x} ({len(data)} bytes):")
@@ -397,7 +376,7 @@ def main():
     print("\nCreating virtual gamepad (uinput)...")
     try:
         uinput_fd = create_uinput_gamepad()
-        print("  ✓ Virtual gamepad active at /dev/uinput")
+        print(f"  ✓ Virtual gamepad active (fd={uinput_fd.fd})")
     except Exception as e:
         print(f"  WARNING: uinput failed ({e}) — gamepad forwarding disabled")
         uinput_fd = None
@@ -412,8 +391,9 @@ def main():
     print("=" * 60 + "\n")
 
     stop = threading.Event()
+    seq_ref = [10]  # shared mutable sequence counter for monitor_gip replies
     threads = [
-        threading.Thread(target=monitor_gip,   args=(dev, uinput_fd, stop), daemon=True),
+        threading.Thread(target=monitor_gip,   args=(dev, uinput_fd, stop, seq_ref), daemon=True),
         threading.Thread(target=monitor_ctrl,  args=(dev, stop), daemon=True),
         threading.Thread(target=monitor_audio, args=(dev, stop), daemon=True),
     ]
@@ -437,8 +417,6 @@ def main():
             pass
 
     if uinput_fd:
-        import fcntl
-        fcntl.ioctl(uinput_fd, UI_DEV_DESTROY)
         uinput_fd.close()
 
     print("Done")
