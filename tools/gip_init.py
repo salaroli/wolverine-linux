@@ -399,25 +399,34 @@ def monitor_audio(dev, stop: threading.Event) -> None:
     """Read EP3 IN — isochronous mic stream."""
     print("[audio-in]  Monitoring EP3 IN (isochronous mic)...")
     count = 0
+    reads = 0
+    last_debug = time.time()
     while not stop.is_set():
         try:
-            data = bytes(dev.read(EP_AUDIO_IN, 228, timeout=100))
-            if data:
+            raw = dev.read(EP_AUDIO_IN, 228, timeout=100)
+            data = bytes(raw)
+            reads += 1
+            if data and any(data):
                 count += 1
                 if count <= 3:
                     ts = time.strftime("%H:%M:%S")
-                    print(f"\n[audio-in {ts}] EP3 IN {len(data)} bytes (#{count}):")
+                    print(f"\n[audio-in {ts}] EP3 IN {len(data)} bytes non-zero (#{count}):")
                     hexdump(data)
                 elif count == 4:
                     print("[audio-in] ✓ Stream active — mic audio is flowing!")
         except usb.core.USBTimeoutError:
-            if count > 0:
-                print(f"[audio-in] stream paused after {count} packets")
-                count = 0
+            pass
         except usb.core.USBError as e:
             if not stop.is_set():
                 print(f"[audio-in] error: {e}")
             time.sleep(0.1)
+
+        now = time.time()
+        if now - last_debug >= 5.0:
+            print(f"[audio-in] debug: {reads} reads in 5s — "
+                  f"{count} non-silent packets total")
+            reads = 0
+            last_debug = now
 
 
 # ---------------------------------------------------------------------------
