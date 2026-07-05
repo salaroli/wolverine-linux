@@ -555,9 +555,9 @@ def gip_auth_handshake(dev, seq_ref: list) -> bool:
     # ------------------------------------------------------------------
     # STEP B — wait for device AUTH-level ACK (cmd 0x06 with AUTH_OPT_ACK)
     # ------------------------------------------------------------------
-    auth_ack, ack_seq = _recv_auth_pkt(dev, timeout_sec=4.0)
+    auth_ack, ack_seq = _recv_auth_pkt(dev, timeout_sec=8.0)
     if auth_ack is None:
-        print("  [auth] timeout waiting for AUTH ACK")
+        print("  [auth] timeout waiting for AUTH ACK (device sent nothing)")
         return False
 
     print(f"  [auth] ← AUTH response ({len(auth_ack)} bytes):")
@@ -930,22 +930,50 @@ def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
 # IDENTIFY response receiver
 # ---------------------------------------------------------------------------
 
+def _drain_buffer(dev, timeout_ms: int = 200) -> list[bytes]:
+    """Drain all pending incoming packets from EP1, print them, return list."""
+    packets = []
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        try:
+            raw = bytes(dev.read(EP_GIP_IN, 64, timeout=min(100, timeout_ms)))
+        except usb.core.USBTimeoutError:
+            break
+        except usb.core.USBError:
+            break
+        if not raw:
+            break
+        h = decode_gip_header(raw)
+        tag = f"cmd=0x{h[0]:02x} opts=0x{h[1]:02x} seq={h[2]}" if h else "???"
+        print(f"  [drain] ← {tag} ({len(raw)}B)")
+        hexdump(raw[:min(len(raw), 32)])
+        packets.append(raw)
+    return packets
+
+
 def _receive_identify_response(dev, our_seq: int) -> bytes | None:
     """Receive the device's IDENTIFY response, sending proper ACKs for each chunk.
-    Prints raw bytes so we can decode the device's capability advertisement.
-    Returns the full payload or None.
+
+    The Wolverine uses CHUNK (0x80) without CHUNK_START (0x40).
+    Chunk order is determined by chunk_offset (=position in buffer).
+    First chunk has chunk_offset=0; subsequent chunks have increasing offsets.
+    Total length is unknown until the empty chunk arrives.
     """
-    chunk_buf   = None
-    chunk_total = 0
+    # Accumulate into a bytearray that grows as needed
+    chunk_buf   = bytearray(512)
+    chunk_total = 0       # 0 = unknown until empty chunk
     chunk_recvd = 0
-    deadline    = time.time() + 2.0
+    last_seq    = None
+    deadline    = time.time() + 2.5
 
     while time.time() < deadline:
         ms = max(50, int((deadline - time.time()) * 1000))
         try:
             raw = bytes(dev.read(EP_GIP_IN, 64, timeout=min(ms, 300)))
         except usb.core.USBTimeoutError:
-            break
+            if chunk_recvd > 0:
+                break   # got some data, timeout = transfer done
+            continue
         except usb.core.USBError:
             break
 
@@ -962,42 +990,38 @@ def _receive_identify_response(dev, our_seq: int) -> bytes | None:
         hexdump(raw[:min(len(raw), 32)])
 
         if rcmd != GIP_CMD_IDENTIFY:
-            # Not IDENTIFY — might be STATUS, ANNOUNCE, etc.; skip
             continue
 
+        last_seq   = rseq
         chunk_data = raw[hdr_len:hdr_len + pkt_len]
 
-        if ropts & GIP_OPT_CHUNK_START:
-            chunk_total = chunk_offset          # total expected length
-            chunk_buf   = bytearray(max(chunk_total, pkt_len))
-            chunk_buf[0:pkt_len] = chunk_data
-            chunk_recvd = pkt_len
-            if ropts & GIP_OPT_ACK:
-                _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_IDENTIFY,
-                                        chunk_recvd, chunk_total)
-        elif ropts & GIP_OPT_CHUNK:
-            if pkt_len == 0:
-                print(f"  IDENTIFY response complete ({chunk_recvd}B total)")
-                break
-            if chunk_buf is not None:
-                end = chunk_offset + pkt_len
-                if end <= len(chunk_buf):
-                    chunk_buf[chunk_offset:end] = chunk_data
-                chunk_recvd = max(chunk_recvd, end)
-            if ropts & GIP_OPT_ACK:
-                _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_IDENTIFY,
-                                        chunk_recvd, chunk_total)
-            if chunk_recvd >= chunk_total > 0:
-                print(f"  IDENTIFY response complete ({chunk_recvd}B total)")
-                break
-        else:
-            # Single non-chunked IDENTIFY response
+        if not (ropts & GIP_OPT_CHUNK):
+            # Non-chunked single response
             chunk_buf   = bytearray(chunk_data)
             chunk_recvd = pkt_len
             print(f"  IDENTIFY response (non-chunked, {chunk_recvd}B)")
             break
 
-    if chunk_buf and chunk_recvd:
+        # Chunked packet (with or without CHUNK_START flag)
+        if pkt_len == 0:
+            # Empty chunk = transfer complete. chunk_offset might encode total length.
+            if chunk_offset > 0:
+                chunk_total = chunk_offset
+            print(f"  IDENTIFY response complete ({chunk_recvd}B total, declared={chunk_total})")
+            break
+
+        # Grow buffer if needed
+        end = chunk_offset + pkt_len
+        if end > len(chunk_buf):
+            chunk_buf.extend(bytearray(end - len(chunk_buf) + 64))
+        chunk_buf[chunk_offset:end] = chunk_data
+        chunk_recvd = max(chunk_recvd, end)
+
+        if ropts & GIP_OPT_ACK:
+            _send_gip_ack_for_chunk(dev, rseq, GIP_CMD_IDENTIFY,
+                                    chunk_recvd, chunk_total)
+
+    if chunk_recvd > 0:
         data = bytes(chunk_buf[:chunk_recvd])
         print(f"\n  Full IDENTIFY payload ({chunk_recvd}B):")
         hexdump(data)
@@ -1018,6 +1042,10 @@ def gip_init(dev) -> list:
     print("\n" + "=" * 60)
     print("STEP 1 — IDENTIFY")
     print("=" * 60)
+    # Drain any spontaneous packets (ANNOUNCE etc.) already queued by device
+    print("  [pre-drain] clearing buffer...")
+    _drain_buffer(dev, timeout_ms=300)
+
     gip_send(dev, pkt_identify(seq_ref[0]), "IDENTIFY")
     seq_ref[0] += 1
     # Receive and ACK the device's IDENTIFY response (may be chunked).
