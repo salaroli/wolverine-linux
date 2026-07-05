@@ -79,16 +79,25 @@ def pkt_identify(seq: int) -> bytes:
     return build_packet(GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, seq)
 
 
+AUD_CLIENT = 0x01  # audio subsystem uses client_id=1 (opts bit 0)
+
 def pkt_audio_format(seq: int) -> bytes:
     payload = bytes([GIP_AUD_CTRL_FORMAT,
                      GIP_AUD_FORMAT_48KHZ_STEREO,
                      GIP_AUD_FORMAT_48KHZ_STEREO])
-    return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL, seq, payload)
+    return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL | AUD_CLIENT, seq, payload)
 
 
 def pkt_audio_volume(seq: int, out_vol: int = 100, in_vol: int = 100) -> bytes:
     payload = bytes([GIP_AUD_CTRL_VOLUME, 0x04, out_vol, 100, in_vol, 0x00, 0x00, 0x00])
-    return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL, seq, payload)
+    return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL | AUD_CLIENT, seq, payload)
+
+
+def pkt_audio_volume_chat(seq: int, state: int = 0x04,
+                          v1: int = 25, v2: int = 25, v3: int = 100) -> bytes:
+    """Mirror the device's own volume_chat format (subcommand 0x00)."""
+    payload = bytes([GIP_AUD_CTRL_VOLUME_CHAT, state, v1, v2, v3])
+    return build_packet(GIP_CMD_AUDIO_CONTROL, GIP_OPT_INTERNAL | AUD_CLIENT, seq, payload)
 
 
 def pkt_ack(ack_cmd: int, ack_opts: int, ack_seq: int) -> bytes:
@@ -243,6 +252,14 @@ def gip_init(dev) -> None:
     seq += 1
     time.sleep(0.05)
 
+    print("\n" + "=" * 60)
+    print("STEP 4 — VOLUME_CHAT (unmute, announce audio ready)")
+    print("=" * 60)
+    gip_send(dev, pkt_audio_volume_chat(seq), "VOLUME_CHAT")
+    resp = gip_recv(dev, "VOLUME_CHAT response")
+    seq += 1
+    time.sleep(0.05)
+
 
 # ---------------------------------------------------------------------------
 # Monitor threads
@@ -268,15 +285,17 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[gip {ts}] AUDIO_CONTROL subcommand=0x{sub:02x}:")
                 hexdump(data)
-                # Device is telling us its audio state — reply with our volume
-                if sub == 0x00:
-                    s = seq_ref[0]
-                    seq_ref[0] += 1
+                # Device sends its volume state — echo back in same format (subcommand 0x00)
+                if sub == 0x00 and len(data) >= 9:
+                    state, v1, v2, v3 = data[5], data[6], data[7], data[8]
+                    s = seq_ref[0]; seq_ref[0] += 1
                     try:
-                        dev.write(EP_GIP_OUT, pkt_audio_volume(s), timeout=TIMEOUT_MS)
-                        print(f"  → sent VOLUME in response (seq={s})")
+                        dev.write(EP_GIP_OUT,
+                                  pkt_audio_volume_chat(s, state, v1, v2, v3),
+                                  timeout=TIMEOUT_MS)
+                        print(f"  → sent VOLUME_CHAT echo (seq={s}, state=0x{state:02x})")
                     except usb.core.USBError as e:
-                        print(f"  → VOLUME send failed: {e}")
+                        print(f"  → VOLUME_CHAT send failed: {e}")
                 # ACK if requested
                 if opts & GIP_OPT_ACKNOWLEDGE:
                     try:
@@ -316,9 +335,11 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
 def stream_audio_out(dev, stop: threading.Event) -> None:
     """Send silence on EP3 OUT (isochronous) to open the bidirectional audio channel.
     USB isochronous audio requires the host to continuously feed the OUT endpoint;
-    the device won't activate EP3 IN (mic) until the output stream is running."""
-    # 48kHz stereo 16-bit = 192 bytes/ms; pad to max packet size (228)
-    silence = bytes(192)
+    the device won't activate EP3 IN (mic) until the output stream is running.
+    Format: 2-byte LE length header + raw PCM silence (gip_pkt_audio_samples)."""
+    # 48kHz stereo 16-bit = 192 bytes/ms
+    audio_len = 192
+    silence = struct.pack("<H", audio_len) + bytes(audio_len)  # 194 bytes total
     interval = 0.001  # 1ms
     print("[audio-out] Streaming silence on EP3 OUT to open audio channel...")
     errors = 0
