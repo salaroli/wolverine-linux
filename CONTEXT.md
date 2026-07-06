@@ -482,24 +482,43 @@ limpo no plug/unplug/replug).
 **Estado do git:** `main` tem PR #1 (gip-init legado) e PR #2 (rewrite Rust)
 mergeados. **PR #3** (`feat/systemd-daemon`) aberta com o daemon, aguardando merge.
 
-**⏳ PRÓXIMO FOCO — latência de áudio (voz sai atrasada).** Ainda não investigado.
-Ordem sugerida (mais provável → menos):
-1. **Baixar o priming de OUT:** `OUT_PRIME_BYTES` em `iso.rs` (hoje `192*40` = ~40ms)
-   → ~10–15ms. É latência fixa embutida antes de drenar áudio real.
-2. **Menos runway em voo:** `OUT_NUM_XFERS`×`OUT_PKTS_PER_XFER` em `iso.rs`
-   (hoje 6×8 = ~48ms) → ex. 4×4. Corta latência ao custo de menos folga contra gaps.
-3. **Hint de latência no PipeWire:** passar `PW_KEY_NODE_LATENCY` (quantum menor)
-   nas properties do sink em `audio.rs`.
-4. **Instrumentar antes de chutar:** o log `[iso] … ring XB` já mostra a fila em
-   regime; medir quantos ms acumulam e ajustar por dado.
+**🚧 EM ANDAMENTO — latência de áudio (voz sai atrasada).** Branch `fix/audio-latency`.
 
-⚠️ Trade-off **latência × underrun**: baixar demais o priming/runway pode trazer de
-volta a voz robótica (gaps no stream iso). É trabalho **iterativo com teste no
-hardware** — mexe num parâmetro, escuta, ajusta.
+A cadeia de buffering **nossa** na saída (playback → fones) — tudo latência somável:
 
-**Para retomar:** após mergear a PR #3, `git checkout main && git pull`, criar
-`fix/audio-latency`, ajustar os parâmetros acima e testar (`sudo systemctl restart
-wolverined`, ou rodar o binário à mão com fones no jack e falar/tocar áudio).
+| Estágio | Buffer | Onde | Knob (env) |
+|---|---|---|---|
+| Quantum do PipeWire (sink) | ~21–43ms (default do grafo) | `audio.rs` | `WOLVERINE_QUANTUM` (frames, default 512 ≈ 10.6ms) |
+| Priming do ring OUT | 40ms fixo | `iso.rs` | `WOLVERINE_PRIME_MS` (default 40) |
+| Transfers iso em voo | 48ms (6×8 pkt de 1ms) | `iso.rs` | `WOLVERINE_OUT_XFERS`×`WOLVERINE_OUT_PKTS` (default 6×8) |
+| DAC do device | pequeno | firmware | — |
+
+**O que já foi feito nesta branch:**
+1. **Hint `PW_KEY_NODE_LATENCY`** no sink **e** source (`audio.rs`) — pede quantum menor
+   (`<frames>/<rate>`), default 512 frames. Corta o buffering do PipeWire e, como encolhe
+   os bursts do produtor, **permite** baixar o priming sem underrun. Baixo risco.
+2. **Priming, nº de transfers e pacotes/transfer viraram env-tunáveis** (`iso.rs`), com os
+   **defaults conhecidos-bons** (40ms / 6 / 8) — a primeira execução não regride. O log de
+   bring-up agora imprime `Xms in flight, Yms prime`, e o `[iso] … ring XB` a cada 5s mostra
+   a fila em regime (medir antes de chutar).
+
+**Sinergia importante:** baixar `WOLVERINE_QUANTUM` primeiro; com bursts menores dá pra
+baixar `WOLVERINE_PRIME_MS` junto sem trazer a voz robótica de volta.
+
+**Procedimento de sweep (hardware no loop, sem recompilar):**
+```bash
+sudo systemctl stop wolverined                        # libera o device
+cd rust && cargo build --release
+# rodar à mão com fones no jack; SUDO_UID mira a sessão PipeWire do usuário
+sudo WOLVERINE_QUANTUM=256 WOLVERINE_PRIME_MS=15 WOLVERINE_OUT_XFERS=4 \
+     RUST_LOG=info ./target/release/wolverined
+# falar/tocar áudio, escutar. Ajustar os números, repetir. Ctrl+C entre tentativas.
+```
+Quando achar o ponto ideal: fixar como defaults nos `DEFAULT_*` consts, `sudo cp
+target/release/wolverined /usr/local/bin/`, `sudo systemctl start wolverined`.
+
+⚠️ Trade-off **latência × underrun**: baixar demais o priming/runway traz de volta a voz
+robótica (gaps no stream iso). Iterativo — mexe, escuta, ajusta.
 
 ---
 

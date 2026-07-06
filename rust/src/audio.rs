@@ -37,6 +37,21 @@ pub const IN_CHANNELS: u32 = 1;
 /// ~1.3s at 96 KB/s; generous, like the C shim's 512 KiB.
 const RING_CAPACITY: usize = 256 * 1024;
 
+/// Requested node quantum (frames) for the sink/source, exposed as a
+/// `PW_KEY_NODE_LATENCY` hint (`<frames>/<rate>`). Smaller = less PipeWire-side
+/// buffering (the default graph quantum is often 1024–2048 = 21–43ms at 48kHz),
+/// which also lets the iso OUT priming drop without underrunning. Overridable
+/// via `WOLVERINE_QUANTUM` for hardware-in-the-loop latency tuning.
+const DEFAULT_QUANTUM: u32 = 512;
+
+fn quantum_frames() -> u32 {
+    std::env::var("WOLVERINE_QUANTUM")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&q| q > 0)
+        .unwrap_or(DEFAULT_QUANTUM)
+}
+
 /// USB-side ring endpoints handed to the iso engine (iso.rs).
 pub struct Rings {
     /// System playback audio to drain into EP3 OUT (sink `process` produces it).
@@ -170,6 +185,15 @@ fn run_pw(
 
     let in_stride = (in_channels as usize) * std::mem::size_of::<i16>();
 
+    // Latency hint: request a small quantum so PipeWire buffers less ahead of us.
+    let quantum = quantum_frames();
+    let sink_latency = format!("{quantum}/{out_rate}");
+    let source_latency = format!("{quantum}/{in_rate}");
+    log::info!(
+        "requesting node latency: sink {sink_latency}, source {source_latency} \
+         (quantum {quantum} frames; set WOLVERINE_QUANTUM to tune)"
+    );
+
     // --- sink: "Wolverine Headphones" (system plays in, we read it out) ---
     let sink = pw::stream::StreamBox::new(
         &core,
@@ -179,6 +203,7 @@ fn run_pw(
             *pw::keys::MEDIA_CLASS => "Audio/Sink",
             *pw::keys::NODE_NAME => "wolverine_headphones",
             *pw::keys::NODE_DESCRIPTION => "Wolverine Headphones",
+            *pw::keys::NODE_LATENCY => sink_latency,
         },
     )?;
     let _sink_listener = sink
@@ -222,6 +247,7 @@ fn run_pw(
             *pw::keys::MEDIA_CLASS => "Audio/Source",
             *pw::keys::NODE_NAME => "wolverine_mic",
             *pw::keys::NODE_DESCRIPTION => "Wolverine Microphone",
+            *pw::keys::NODE_LATENCY => source_latency,
         },
     )?;
     let _source_listener = source
