@@ -12,6 +12,8 @@ Run as root.
 
 import os
 import sys
+import shutil
+import subprocess
 import time
 import hmac
 import struct
@@ -909,6 +911,26 @@ def create_uinput_gamepad() -> UInput:
     )
 
 
+def create_uinput_media() -> UInput:
+    """Separate keyboard-only device for the media buttons. Kept apart from the
+    gamepad because libinput classifies a device with ABS axes + gamepad buttons
+    as a joystick and does NOT deliver its KEY_* events to Wayland compositors.
+    A pure EV_KEY device is seen as a keyboard, so the media keys reach Hyprland.
+    """
+    return UInput(
+        events={
+            ecodes.EV_KEY: [
+                ecodes.KEY_VOLUMEUP, ecodes.KEY_VOLUMEDOWN,
+                ecodes.KEY_MUTE, ecodes.KEY_MICMUTE,
+            ],
+        },
+        name="Razer Wolverine Ultimate Media Keys",
+        vendor=VENDOR_ID,
+        product=PRODUCT_ID,
+        version=0x0101,
+    )
+
+
 def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
     if len(data) < 4 + 12:
         return
@@ -943,6 +965,86 @@ def parse_and_forward_gamepad(ui: UInput, data: bytes) -> None:
     ui.write(ecodes.EV_ABS, ecodes.ABS_RY,    ry)
     ui.write(ecodes.EV_ABS, ecodes.ABS_RZ,    rt)
     ui.syn()
+
+
+# ---------------------------------------------------------------------------
+# Media buttons (headset audio controls)
+# ---------------------------------------------------------------------------
+# The Wolverine's physical mute/volume buttons are NOT in the INPUT report —
+# they arrive as AUDIO_CONTROL sub 0x00 (VOLUME_CHAT) reports:
+#   data[5] = mute state  (GIP_AUD_VOLUME_UNMUTED 0x04 / MIC_MUTED 0x05)
+#   data[6] = volume level (absolute, 0x00..0x64 = 0..100)
+#
+# The controller keeps an ABSOLUTE volume (0-100): a single click bumps it up,
+# hold + D-pad down lowers it. Two mirror modes:
+#   MEDIA_MODE_ABSOLUTE  → sync PipeWire to the exact level via wpctl (knob == slider)
+#   MEDIA_MODE_KEYS      → emit relative KEY_VOLUMEUP/DOWN + KEY_MICMUTE via uinput
+MEDIA_MODE_ABSOLUTE = True
+
+# Absolute mode targets (wpctl). The mute button mutes the mic on Xbox, so it
+# maps to the default source; volume maps to the default sink.
+MEDIA_SINK   = "@DEFAULT_AUDIO_SINK@"
+MEDIA_SOURCE = "@DEFAULT_AUDIO_SOURCE@"
+
+# Keys mode fallback: the controller mute button mutes the mic.
+MEDIA_MUTE_KEY = ecodes.KEY_MICMUTE
+
+_media_state = {"mute": None, "vol": None}
+
+
+def _wpctl(*args: str) -> None:
+    """Run wpctl as the invoking user — PipeWire lives in that user's session,
+    not root's. Uses SUDO_USER / SUDO_UID set by sudo. Best-effort, non-blocking."""
+    if shutil.which("wpctl") is None:
+        return
+    cmd = ["wpctl", *args]
+    user = os.environ.get("SUDO_USER")
+    uid  = os.environ.get("SUDO_UID")
+    if os.geteuid() == 0 and user and uid:
+        cmd = ["sudo", "-u", user, "env",
+               f"XDG_RUNTIME_DIR=/run/user/{uid}", *cmd]
+    try:
+        subprocess.run(cmd, timeout=1.0,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _tap_key(ui: UInput, key: int) -> None:
+    ui.write(ecodes.EV_KEY, key, 1)
+    ui.syn()
+    ui.write(ecodes.EV_KEY, key, 0)
+    ui.syn()
+
+
+def forward_media(ui: UInput | None, data: bytes) -> None:
+    """Mirror an AUDIO_CONTROL sub 0x00 (VOLUME_CHAT) report to the system.
+    First report only establishes a baseline, so connecting the controller never
+    yanks the system volume — we act on changes only."""
+    if len(data) < 7:
+        return
+    mute, vol = data[5], data[6]
+    muted = (mute == 0x05)
+
+    prev_mute = _media_state["mute"]
+    if prev_mute is not None and mute != prev_mute:
+        if MEDIA_MODE_ABSOLUTE:
+            _wpctl("set-mute", MEDIA_SOURCE, "1" if muted else "0")
+        elif ui is not None:
+            _tap_key(ui, MEDIA_MUTE_KEY)
+        print(f"  → media: MIC {'muted' if muted else 'unmuted'}")
+    _media_state["mute"] = mute
+
+    prev_vol = _media_state["vol"]
+    if prev_vol is not None and vol != prev_vol:
+        up = vol > prev_vol
+        if MEDIA_MODE_ABSOLUTE:
+            # Snap the sink to the controller's absolute level (0-100 → fraction).
+            _wpctl("set-volume", "-l", "1.0", MEDIA_SINK, f"{vol / 100:.2f}")
+        elif ui is not None:
+            _tap_key(ui, ecodes.KEY_VOLUMEUP if up else ecodes.KEY_VOLUMEDOWN)
+        print(f"  → media: VOL {'+' if up else '-'} ({prev_vol}→{vol} = {vol}%)")
+    _media_state["vol"] = vol
 
 
 # ---------------------------------------------------------------------------
@@ -1133,7 +1235,8 @@ def gip_init(dev) -> list:
 # Monitor threads
 # ---------------------------------------------------------------------------
 
-def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) -> None:
+def monitor_gip(dev, ui: UInput | None, ui_media: UInput | None,
+                stop: threading.Event, seq_ref: list) -> None:
     print("[gip] Monitoring EP1 IN...")
     while not stop.is_set():
         try:
@@ -1161,6 +1264,8 @@ def monitor_gip(dev, ui: UInput | None, stop: threading.Event, seq_ref: list) ->
                 hexdump(data)
                 if sub == 0x00 and len(data) >= 9:
                     state_b = data[5]
+                    # Media buttons: mute state + volume level ride on this report
+                    forward_media(ui_media, data)
                     s = seq_ref[0]; seq_ref[0] += 1
                     try:
                         dev.write(EP_GIP_OUT,
@@ -1325,6 +1430,14 @@ def main():
         print(f"  WARNING: uinput failed ({e}) — gamepad forwarding disabled")
         uinput_fd = None
 
+    print("Creating virtual media-key keyboard (uinput)...")
+    try:
+        uinput_media = create_uinput_media()
+        print(f"  ✓ Virtual media keyboard active (fd={uinput_media.fd})")
+    except Exception as e:
+        print(f"  WARNING: media uinput failed ({e}) — media buttons disabled")
+        uinput_media = None
+
     # GIP init (IDENTIFY + AUTH + AUDIO FORMAT)
     # Auth and audio format negotiation happen with alt=0 (isochronous endpoints idle).
     seq_ref = gip_init(dev)
@@ -1354,7 +1467,7 @@ def main():
     print("=" * 60 + "\n")
 
     threads = [
-        threading.Thread(target=monitor_gip,  args=(dev, uinput_fd, stop, seq_ref), daemon=True),
+        threading.Thread(target=monitor_gip,  args=(dev, uinput_fd, uinput_media, stop, seq_ref), daemon=True),
         threading.Thread(target=monitor_ctrl, args=(dev, stop), daemon=True),
     ]
     for t in threads:
@@ -1378,6 +1491,8 @@ def main():
 
     if uinput_fd:
         uinput_fd.close()
+    if uinput_media:
+        uinput_media.close()
 
     print("Done")
 
