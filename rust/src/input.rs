@@ -33,21 +33,34 @@ pub enum MediaMode {
     Keys,
 }
 
-/// Gamepad buttons in report-bit order (mask, key). Ported from `btn_map`.
-/// evdev uses the SOUTH/EAST/NORTH/WEST names: A/B/X/Y respectively.
+/// Gamepad buttons in report-bit order (mask, key). This is the STANDARD Xbox
+/// One GIP layout as decoded by the kernel `xpad` driver — the source of truth,
+/// since the gamepad already worked via xpad. (The old Python `btn_map` was
+/// shifted by one bit, e.g. 0x08 → "A" when it is actually View/Select.)
+///
+/// The u16 is `data[4]` (low byte) | `data[5]` (high byte):
+///   data[4]: bit2 Menu(Start), bit3 View(Select), bit4 A, bit5 B, bit6 X, bit7 Y
+///   data[5]: bits0-3 dpad U/D/L/R (handled as HAT), bit4 LB, bit5 RB,
+///            bit6 LS-click, bit7 RS-click
+/// evdev names: A=SOUTH, B=EAST, X=WEST, Y=NORTH (Linux BTN_X=WEST, BTN_Y=NORTH).
 const BTN_MAP: &[(u16, Key)] = &[
-    (0x0001, Key::BTN_SELECT),
-    (0x0002, Key::BTN_MODE),
-    (0x0004, Key::BTN_START),
-    (0x0008, Key::BTN_SOUTH), // A
-    (0x0010, Key::BTN_EAST),  // B
-    (0x0020, Key::BTN_NORTH), // X
-    (0x0040, Key::BTN_WEST),  // Y
-    (0x0100, Key::BTN_TL),
-    (0x0200, Key::BTN_TR),
-    (0x1000, Key::BTN_THUMBL),
-    (0x2000, Key::BTN_THUMBR),
+    (0x0004, Key::BTN_START),  // Menu
+    (0x0008, Key::BTN_SELECT), // View
+    (0x0010, Key::BTN_SOUTH),  // A
+    (0x0020, Key::BTN_EAST),   // B
+    (0x0040, Key::BTN_WEST),   // X
+    (0x0080, Key::BTN_NORTH),  // Y
+    (0x1000, Key::BTN_TL),     // LB
+    (0x2000, Key::BTN_TR),     // RB
+    (0x4000, Key::BTN_THUMBL), // LS click
+    (0x8000, Key::BTN_THUMBR), // RS click
 ];
+
+// D-pad bit masks (reported as HAT0 axes, not buttons).
+const DPAD_UP: u16 = 0x0100;
+const DPAD_DOWN: u16 = 0x0200;
+const DPAD_LEFT: u16 = 0x0400;
+const DPAD_RIGHT: u16 = 0x0800;
 
 pub struct Uinput {
     gamepad: VirtualDevice,
@@ -55,6 +68,7 @@ pub struct Uinput {
     mode: MediaMode,
     last_mute: Option<u8>,
     last_vol: Option<u8>,
+    last_buttons: Option<u16>,
 }
 
 impl Uinput {
@@ -69,28 +83,58 @@ impl Uinput {
             mode,
             last_mute: None,
             last_vol: None,
+            last_buttons: None,
         })
     }
 
-    /// Translate a GIP INPUT (0x20) report into gamepad ABS/BTN events.
-    /// Payload layout (after the 4-byte GIP header): u16 buttons, u8 LT, u8 RT,
-    /// i16 LX, i16 LY, i16 RX, i16 RY. Ported from `parse_and_forward_gamepad`.
+    /// Translate a GIP INPUT (0x20) report into gamepad ABS/BTN events, using
+    /// the standard Xbox One layout (matches the kernel `xpad` driver).
+    ///
+    /// Payload (14 bytes, after the 4-byte GIP header = data[4..18]):
+    ///   [0..2]   buttons (u16 LE)
+    ///   [2..4]   LT (u16 LE, 0..1023)   [4..6]  RT
+    ///   [6..8]   LX (s16 LE)  [8..10] LY (inverted)
+    ///   [10..12] RX (s16 LE)  [12..14] RY (inverted)
     pub fn forward_gamepad(&mut self, data: &[u8]) -> Result<()> {
-        if data.len() < 4 + 12 {
+        if data.len() < 18 {
             return Ok(());
         }
         let p = &data[4..];
         let buttons = u16::from_le_bytes([p[0], p[1]]);
-        let lt = p[2] as i32;
-        let rt = p[3] as i32;
-        let lx = i16::from_le_bytes([p[4], p[5]]) as i32;
-        let ly = i16::from_le_bytes([p[6], p[7]]) as i32;
-        let rx = i16::from_le_bytes([p[8], p[9]]) as i32;
-        let ry = i16::from_le_bytes([p[10], p[11]]) as i32;
 
-        let mut events = Vec::with_capacity(BTN_MAP.len() + 6);
+        // Ground-truth aid for verifying/extending the mapping (e.g. the Guide
+        // button): logs the raw bitmask whenever it changes. `RUST_LOG=debug`.
+        if self.last_buttons != Some(buttons) {
+            log::debug!("gamepad buttons = {buttons:#06x}");
+            self.last_buttons = Some(buttons);
+        }
+
+        let lt = u16::from_le_bytes([p[2], p[3]]) as i32;
+        let rt = u16::from_le_bytes([p[4], p[5]]) as i32;
+        let lx = i16::from_le_bytes([p[6], p[7]]) as i32;
+        // Xbox reports Y up-positive; evdev wants up-negative → invert (like xpad).
+        let ly = (!i16::from_le_bytes([p[8], p[9]])) as i32;
+        let rx = i16::from_le_bytes([p[10], p[11]]) as i32;
+        let ry = (!i16::from_le_bytes([p[12], p[13]])) as i32;
+
+        let hat_x = if buttons & DPAD_LEFT != 0 {
+            -1
+        } else if buttons & DPAD_RIGHT != 0 {
+            1
+        } else {
+            0
+        };
+        let hat_y = if buttons & DPAD_UP != 0 {
+            -1
+        } else if buttons & DPAD_DOWN != 0 {
+            1
+        } else {
+            0
+        };
+
+        let mut events = Vec::with_capacity(BTN_MAP.len() + 8);
         for &(mask, key) in BTN_MAP {
-            let pressed = if buttons & mask != 0 { 1 } else { 0 };
+            let pressed = i32::from(buttons & mask != 0);
             events.push(InputEvent::new(EventType::KEY, key.code(), pressed));
         }
         for (axis, val) in [
@@ -100,6 +144,8 @@ impl Uinput {
             (AbsoluteAxisType::ABS_RX, rx),
             (AbsoluteAxisType::ABS_RY, ry),
             (AbsoluteAxisType::ABS_RZ, rt),
+            (AbsoluteAxisType::ABS_HAT0X, hat_x),
+            (AbsoluteAxisType::ABS_HAT0Y, hat_y),
         ] {
             events.push(InputEvent::new(EventType::ABSOLUTE, axis.0, val));
         }
@@ -165,7 +211,7 @@ fn build_gamepad() -> Result<VirtualDevice> {
         keys.insert(k);
     }
     let stick = AbsInfo::new(0, -32768, 32767, 16, 128, 0);
-    let trigger = AbsInfo::new(0, 0, 255, 0, 0, 0);
+    let trigger = AbsInfo::new(0, 0, 1023, 0, 0, 0); // Xbox One triggers are 10-bit
     let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
 
     let mut builder = VirtualDeviceBuilder::new()?
