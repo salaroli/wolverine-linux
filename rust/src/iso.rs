@@ -88,6 +88,7 @@ struct EngineState {
     running: AtomicBool,
     out_pkts: u64,
     out_silence: u64,
+    out_trimmed: u64, // bytes dropped to bound playback latency (clock drift)
     in_bytes: u64,
 }
 
@@ -161,6 +162,7 @@ impl IsoAudio {
                 running: AtomicBool::new(true),
                 out_pkts: 0,
                 out_silence: 0,
+                out_trimmed: 0,
                 in_bytes: 0,
             }));
 
@@ -310,6 +312,20 @@ extern "system" fn on_out(transfer: *mut ffi::libusb_transfer) {
             st.primed = true;
         }
 
+        // Bound playback latency: PipeWire (producer) and the USB SOF (consumer)
+        // run off independent clocks, so any drift makes the ring creep toward
+        // full and stay there (drop-newest) — seconds of delay. When it grows
+        // past the prime target + hysteresis, drop the oldest excess so only the
+        // freshest ~prime_bytes remain. Aligned to the 4-byte stereo frame.
+        if st.primed {
+            let avail = ring::avail(&st.play);
+            let high = st.prime_bytes + st.prime_bytes.max(OUT_PCM_BYTES);
+            if avail > high {
+                let excess = (avail - st.prime_bytes) & !3;
+                st.out_trimmed += ring::skip(&mut st.play, excess) as u64;
+            }
+        }
+
         let base = (*transfer).buffer;
         let hlen = st.out_hdr.len();
         for i in 0..st.out_pkts_per_xfer {
@@ -392,14 +408,16 @@ fn event_loop(ctx: *mut ffi::libusb_context, engine: *mut EngineState) {
                 let st = &mut *engine;
                 let secs = dt.as_secs_f64();
                 log::info!(
-                    "[iso] OUT {:.0} pkt/s ({} silent/5s, ring {}B) | IN {:.0} PCM B/s",
+                    "[iso] OUT {:.0} pkt/s ({} silent, {}B trimmed/5s, ring {}B) | IN {:.0} PCM B/s",
                     st.out_pkts as f64 / secs,
                     st.out_silence,
+                    st.out_trimmed,
                     ring::avail(&st.play),
                     st.in_bytes as f64 / secs,
                 );
                 st.out_pkts = 0;
                 st.out_silence = 0;
+                st.out_trimmed = 0;
                 st.in_bytes = 0;
             }
             last = Instant::now();

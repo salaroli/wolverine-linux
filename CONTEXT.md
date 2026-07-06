@@ -484,6 +484,37 @@ mergeados. **PR #3** (`feat/systemd-daemon`) aberta com o daemon, aguardando mer
 
 **🚧 EM ANDAMENTO — latência de áudio (voz sai atrasada).** Branch `fix/audio-latency`.
 
+### ⚠️ CAUSA RAIZ (descoberta depois): ring ILIMITADO, não o piso
+
+O teste no Discord mostrou delay de **segundos**, não de ms — o que **refuta** a hipótese
+inicial (afinar priming/quantum/runway, que são todos <100ms). Segundos só têm uma
+explicação nesta arquitetura: **o ring buffer enche e fica cheio**.
+
+- Capacidade: playback `256KB` = **1,37s**; capture/mic `256KB` @ 24kHz mono = **5,46s**.
+- Os dois lados de cada ring rodam em **clocks independentes** (grafo do PipeWire ×
+  SOF do USB). Qualquer drift faz o ring encher monotonicamente. A política do `rtrb` é
+  **drop-newest**: quando cheio, descarta o áudio **novo** e mantém o **velho** → você fica
+  permanentemente ~1,4s (saída) / ~5,5s (mic) atrás.
+- Pior no mic: a thread USB IN produz PCM **continuamente** desde o bring-up, mas nada drena
+  o ring até o Discord abrir o mic — então ele já chega no full de 5,5s antes do primeiro uso.
+- O CONTEXT antigo assumia "streams rate-matched + priming ⇒ drop-newest OK". **Errado:**
+  os clocks não são o mesmo clock; priming/quantum só mexem no **piso**, nunca no **teto**.
+
+**Fix (o que resolve os segundos):** limitar a profundidade do ring **no consumidor**
+(drop-oldest), como o shim C fazia. `ring::skip()` descarta os mais antigos; o consumidor
+de cada ring drena o excesso pra manter só os ~`target` bytes mais frescos:
+- **Playback** (`iso.rs` `on_out`): trima acima de `prime_bytes + histerese` → volta pra ~priming.
+- **Mic** (`audio.rs` source `process`): trima acima de `cap_high` → alvo `WOLVERINE_CAP_MS`
+  (default 40ms). Na primeira captura do Discord, o ring cheio é aparado num tranco → latência
+  corrigida já no primeiro buffer.
+- Diagnóstico: o log `[iso]` agora mostra `…B trimmed/5s` (quanto drift está sendo aparado).
+
+**Lição (a mesma do projeto):** medir o sintoma real antes de afinar. "Latência alta" tem
+duas causas ortogonais — piso (buffers de pipeline, ms) e teto (ring sem bound, segundos).
+O relato "segundos" apontava direto pro teto; os knobs de piso eram a árvore errada.
+
+### Piso (o trabalho original — ainda válido pra afinar de ~100ms pra ~30ms)
+
 A cadeia de buffering **nossa** na saída (playback → fones) — tudo latência somável:
 
 | Estágio | Buffer | Onde | Knob (env) |

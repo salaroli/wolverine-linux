@@ -238,6 +238,20 @@ fn run_pw(
         &mut sink_params,
     )?;
 
+    // Capture (mic) latency cap. The USB IN side produces mic PCM continuously
+    // from bring-up, but nothing drains this ring until an app (e.g. Discord)
+    // opens the mic — so it fills to its full ~5s and, being drop-newest, stays
+    // there: seconds of delay. Keep only the freshest `cap_low` bytes, trimming
+    // the oldest excess once past `cap_high` (hysteresis). Tunable via
+    // WOLVERINE_CAP_MS (target latency in ms).
+    let cap_ms = std::env::var("WOLVERINE_CAP_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(40);
+    let cap_low = (in_rate as usize * in_stride * cap_ms / 1000).max(in_stride);
+    let cap_high = cap_low * 2;
+
     // --- source: "Wolverine Microphone" (we fill mic PCM, system records) ---
     let source = pw::stream::StreamBox::new(
         &core,
@@ -261,6 +275,12 @@ fn run_pw(
                 return;
             }
             let d = &mut datas[0];
+            // Trim the oldest excess so mic latency stays bounded (see cap_low).
+            let avail = ring::avail(&cap_cons);
+            if avail > cap_high {
+                let excess = avail - cap_low;
+                ring::skip(&mut cap_cons, excess - excess % in_stride);
+            }
             let want = if let Some(slice) = d.data() {
                 let frames = slice.len() / in_stride;
                 let want = frames * in_stride;
