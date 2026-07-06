@@ -3,10 +3,18 @@
 ## Objetivo
 
 Criar suporte Linux para as funcionalidades extras do Razer Wolverine Ultimate (1532:0a14):
-- Botões de mídia (2 botões físicos no controle) ← **foco atual, viável**
-- Headphone jack (3.5mm combo) ← **encerrado, limitação de hardware**
+- Headphone jack (3.5mm combo) — saída **e** microfone ← **RESOLVIDO no nível de protocolo** (falta integração com PipeWire/ALSA)
+- Botões de mídia (2 botões físicos no controle) ← **foco atual**
 
 O gamepad em si já funciona nativamente via driver `xpad` do kernel.
+
+> **Marco (breakthrough):** o áudio do jack **funciona no Linux**. A conclusão
+> anterior de "limitação de hardware irreversível" estava **errada**. O elo perdido
+> era o comando GIP `POWER` (`0x05`) com `GIP_PWR_ON` (`0x00`), enviado logo após a
+> negociação de formato — exatamente como o driver [xone](https://github.com/medusalix/xone)
+> faz no bring-up de headset. Sem ele o subsistema de áudio fica idle e o endpoint
+> isócrono só devolve zeros. Com ele: tom de 440Hz **audível nos fones** (DAC) e mic
+> **capturando** (ADC, EP3 IN com PCM real). Ver "O que funciona".
 
 ---
 
@@ -62,8 +70,9 @@ Para pacotes grandes (>58B): GIP usa chunking com CHUNK_START/CHUNK flags e chun
 | 0x02 | ANNOUNCE          | Device envia no boot (consumido pelo xpad antes de detach) |
 | 0x03 | STATUS            | Device envia heartbeat a cada ~20s |
 | 0x04 | IDENTIFY          | Device ignora após xpad ter feito a troca |
-| 0x06 | AUTHENTICATE      | **Device não implementa** — silêncio total |
-| 0x08 | AUDIO_CONTROL     | Sub 0x02 (FORMAT) funciona; sub 0x03 (VOLUME) sempre timeout |
+| 0x05 | POWER             | **CHAVE DO ÁUDIO.** `GIP_PWR_ON`=`0x00` acorda o subsistema de áudio. Faltava — nunca era enviado |
+| 0x06 | AUTHENTICATE      | Device não implementa (silêncio total) — **e é irrelevante:** o caminho de jack no xone pula auth |
+| 0x08 | AUDIO_CONTROL     | Sub 0x02 (FORMAT) funciona; sub 0x03 (VOLUME) dá timeout — **esperado:** xone só manda VOLUME p/ headset não-jack |
 | 0x20 | INPUT             | Reports do gamepad, 14 bytes de payload |
 | 0x60 | AUDIO_SAMPLES     | Dados de áudio (isocrônico) |
 | 0x0f | (Razer propietário) | Responde com cmd=0x10, propósito desconhecido |
@@ -75,38 +84,65 @@ Para pacotes grandes (>58B): GIP usa chunking com CHUNK_START/CHUNK flags e chun
 - **Gamepad:** 100% funcional via `xpad`. Botões, sticks, gatilhos, d-pad, guide button.
 - **Gamepad via userspace (gip_init.py):** re-exposto via uinput quando detachamos o xpad.
 - **GIP AUDIO_FORMAT (sub 0x02):** device ecoa confirmando o formato 48kHz stereo.
-- **EP3 stream (USB):** endpoints isocrônicos abrem. Device envia 228B a ~1ms de intervalo (tudo zeros).
+- **Áudio de saída (DAC):** ✅ tom de 440Hz **audível nos fones** via EP3 OUT, após POWER ON.
+- **Áudio de entrada (mic/ADC):** ✅ EP3 IN passa a mandar **PCM real** (`60 21 …` AUDIO_SAMPLES,
+  amostras 16-bit LE) a ~1000 pacotes/s. Antes do POWER ON eram só zeros (stream idle).
+
+### Sequência de bring-up de áudio que funciona (descoberta comparando com o xone)
+
+1. IDENTIFY (+ ACK dos chunks)
+2. AUDIO_FORMAT — `08` sub `02`, payload `[0x02, in=0x10, out=0x10]` (48kHz stereo). Device ecoa.
+3. **POWER ON — `05`, payload `[0x00]`** ← o passo que faltava. Device responde com um
+   `AUDIO_CONTROL` sub `0x00` reportando volume/mute (`04 19 19 64` = unmuted, 25/25/100).
+4. Ativa alt=1 nas interfaces 1 e 2 → endpoints isócronos abrem **e transportam áudio real**.
+5. VOLUME (sub 0x03) **não é enviado** no caminho de jack (flag `SEND_HW_VOLUME=False`).
+
+Detalhe do auth: o handshake RSA/ECDH (cmd 0x06) continua sem resposta — mas isso **não bloqueia
+o áudio**. No xone o caminho standalone/jack pula auth e battery. A hipótese antiga de "auth é o
+gate do áudio" estava errada.
 
 ---
 
-## O que NÃO funciona — conclusões definitivas
+## Retrospectiva: a conclusão de "áudio impossível" estava errada
 
-### 1. Headphone jack e microfone — ENCERRADO
+Esta seção documenta um erro de análise para que não se repita.
 
-**Conclusão:** limitação de hardware/firmware irreversível. O áudio é exclusivo do Xbox One.
+### Headphone jack e microfone — antes: "ENCERRADO"; agora: **RESOLVIDO**
 
-**Evidências acumuladas:**
-- Razer documenta: "game/chat volume control is only applicable for Xbox One"
-- No Windows também não funciona — não existe driver PC que suporte
-- EP3 IN: 1000 reads/s, todos zeros mesmo falando no mic
-- EP3 OUT: enviando tom de 440Hz, nada audível nos fones
-- AUDIO_CONTROL sub 0x03 (VOLUME): sempre timeout, device ignora completamente
+Durante um bom tempo o projeto tratou o áudio como limitação de hardware irreversível.
+A conclusão se apoiava em três evidências que, na verdade, eram **ambíguas** — todas
+consistentes com "o subsistema nunca foi ligado", não com "o hardware é incapaz":
 
-**Investigação de GIP auth (cmd=0x06) — concluída:**
-- Hipótese: o auth era o "gate" para o áudio (como no driver xone para controles Xbox)
-- Implementamos o handshake TLS-like completo (RSA v1 + ECDH v2) baseado no driver xone
-- Resultado: device não responde ao cmd=0x06. Silêncio absoluto durante 8 segundos de espera
-- **O Wolverine não implementa GIP auth.** Usa versão simplificada do GIP sem handshake de segurança
-- O bloqueio de áudio é no chip interno — o DAC/ADC só ativa com a pilha do Xbox OS
+| Evidência de então | Interpretação correta |
+|---|---|
+| EP3 IN só devolve zeros mesmo falando no mic | Stream isócrono **idle** — o ADC não tinha recebido o comando de ligar (POWER ON) |
+| Tom de 440Hz não sai nos fones | Roteamento de saída idle pelo mesmo motivo |
+| AUDIO_CONTROL sub 0x03 (VOLUME) sempre timeout | Comportamento **normal** de jack — o xone nem envia VOLUME p/ headset de jack |
 
-**Por que o Xbox One consegue e o Linux não:**  
-O Xbox One passa um challenge criptográfico (cmd=0x0f → resposta 64B com cmd=0x10) usando chaves proprietárias do hardware do console. Sem essas chaves, o roteamento analógico interno nunca ativa. O Wolverine não usa o GIP auth padrão; usa um mecanismo Razer/Xbox proprietário diferente.
+Também houve uma **contradição interna** que deveria ter acendido o alerta: dizia-se
+"o áudio só liga depois do auth" **e** "o Wolverine não implementa auth" — se as duas
+fossem verdade, o áudio não funcionaria nem no Xbox One. A saída do impasse foi comparar
+a sequência de bring-up com o driver `xone` e notar que faltava o comando `POWER` (0x05).
 
-### 2. Botões de mídia — STATUS: nunca investigados
+**Lição:** "endpoint só manda zeros" ≠ "hardware morto". Num protocolo tipo GIP, o
+periférico fica em idle até o host mandar o comando de ativação certo, endereçado ao
+client id certo. Antes de declarar algo "impossível por hardware", replicar a sequência
+de um driver de referência que já funciona.
 
-Os botões de volume/mídia físicos no controle nunca apareceram em nenhum evento capturado.
+### Botões de mídia — foco atual (ver "Próximos passos")
+
+Os botões de volume/mídia físicos no controle ainda não apareceram em nenhum evento
+capturado. É a próxima frente.
 
 ---
+
+## Roadmap
+
+1. ✅ **Áudio (protocolo)** — jack e mic funcionam via POWER ON. *Feito.*
+2. 🚧 **Botões de mídia** — foco atual (abaixo).
+3. ⏳ **Integração de áudio com PipeWire/ALSA** — transformar o I/O isócrono raw num
+   sink virtual (fones) + source virtual (mic) do sistema. Depois dos botões.
+4. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot.
 
 ## Próximos passos — FOCO ATUAL: botões de mídia
 
@@ -168,11 +204,12 @@ Driver userspace completo. Faz:
 2. Cria gamepad virtual via uinput
 3. Drena buffer pré-IDENTIFY
 4. Envia IDENTIFY e recebe/ACKa resposta (suporte a chunks sem CHUNK_START)
-5. Tenta GIP auth (falha graciosamente — device não suporta)
+5. Tenta GIP auth (falha graciosamente — device não suporta, e não é necessário p/ jack)
 6. Negocia AUDIO_FORMAT 48kHz stereo
-7. Ativa alt=1 nas interfaces 1 e 2
-8. Monitora EP1 IN (GIP/gamepad), EP2 IN (ctrl/bulk), EP3 IN/OUT (áudio)
-9. Loga bytes 12-13 dos INPUT reports para investigação de botões de mídia
+7. **Envia POWER ON (`pkt_power`, cmd 0x05) — acorda o áudio.** VOLUME fica sob flag `SEND_HW_VOLUME`
+8. Ativa alt=1 nas interfaces 1 e 2
+9. Monitora EP1 IN (GIP/gamepad), EP2 IN (ctrl/bulk), EP3 IN/OUT (áudio — agora com PCM real)
+10. Loga bytes 12-13 dos INPUT reports para investigação de botões de mídia
 
 ### `tools/probe_gip.py` + `probe_results.log`
 

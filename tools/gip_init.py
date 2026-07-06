@@ -80,6 +80,16 @@ GIP_AUD_CTRL_VOLUME      = 0x03
 
 GIP_AUD_FORMAT_48KHZ_STEREO = 0x10
 
+# Power modes (GIP_CMD_POWER payload) — from xone enum gip_power_mode
+GIP_PWR_ON    = 0x00
+GIP_PWR_SLEEP = 0x01
+GIP_PWR_OFF   = 0x04
+
+# Send the hardware VOLUME command (sub 0x03)? In xone this is only sent for
+# non-jack (standalone chat) headsets; for a 3.5mm jack it is skipped entirely,
+# which is why the Wolverine always times out on it. Kept as a flag for probing.
+SEND_HW_VOLUME = False
+
 TIMEOUT_MS = 500
 
 # ---------------------------------------------------------------------------
@@ -799,6 +809,15 @@ def pkt_status(seq: int, status: int = 0x80) -> bytes:
 
 AUD_CLIENT = 0x01
 
+def pkt_power(seq: int, mode: int = GIP_PWR_ON) -> bytes:
+    """GIP_CMD_POWER (0x05). xone sends GIP_PWR_ON right after negotiating the
+    audio format to actually bring the audio subsystem online. Payload is a
+    single mode byte. Without this the DAC/ADC stays idle and EP3 returns zeros.
+    """
+    return build_packet(GIP_CMD_POWER, GIP_CLIENT_ID | GIP_OPT_INTERNAL, seq,
+                        bytes([mode]))
+
+
 def pkt_audio_format(seq: int) -> bytes:
     payload = bytes([GIP_AUD_CTRL_FORMAT,
                      GIP_AUD_FORMAT_48KHZ_STEREO,
@@ -1034,7 +1053,9 @@ def _receive_identify_response(dev, our_seq: int) -> bytes | None:
 # ---------------------------------------------------------------------------
 
 def gip_init(dev) -> list:
-    """Run GIP init: IDENTIFY → AUTH → AUDIO FORMAT → VOLUME.
+    """Run GIP init: IDENTIFY → AUTH → AUDIO FORMAT → POWER ON → (VOLUME).
+    Order follows xone's headset bring-up: format is negotiated first, then
+    GIP_PWR_ON wakes the audio subsystem. HW volume is skipped for jack headsets.
     Returns seq_ref list for use by monitor threads.
     """
     seq_ref = [1]
@@ -1076,20 +1097,34 @@ def gip_init(dev) -> list:
     time.sleep(0.05)
 
     print("\n" + "=" * 60)
-    print("STEP 4 — VOLUME (unmute, 100%)")
+    print("STEP 4 — POWER ON (bring audio subsystem online)")
     print("=" * 60)
-    gip_send(dev, pkt_audio_volume(seq_ref[0]), "VOLUME")
+    # xone sends GIP_PWR_ON right after the format is negotiated. This is the
+    # step that was missing entirely — the ADC/DAC stays idle without it.
+    gip_send(dev, pkt_power(seq_ref[0], GIP_PWR_ON), "POWER_ON")
     seq_ref[0] += 1
-    gip_recv(dev, "VOLUME response")
+    gip_recv(dev, "POWER_ON response")
     time.sleep(0.05)
 
-    print("\n" + "=" * 60)
-    print("STEP 5 — VOLUME_CHAT")
-    print("=" * 60)
-    gip_send(dev, pkt_audio_volume_chat(seq_ref[0]), "VOLUME_CHAT")
-    seq_ref[0] += 1
-    gip_recv(dev, "VOLUME_CHAT response")
-    time.sleep(0.05)
+    if SEND_HW_VOLUME:
+        print("\n" + "=" * 60)
+        print("STEP 5 — VOLUME (unmute, 100%)")
+        print("=" * 60)
+        gip_send(dev, pkt_audio_volume(seq_ref[0]), "VOLUME")
+        seq_ref[0] += 1
+        gip_recv(dev, "VOLUME response")
+        time.sleep(0.05)
+
+        print("\n" + "=" * 60)
+        print("STEP 6 — VOLUME_CHAT")
+        print("=" * 60)
+        gip_send(dev, pkt_audio_volume_chat(seq_ref[0]), "VOLUME_CHAT")
+        seq_ref[0] += 1
+        gip_recv(dev, "VOLUME_CHAT response")
+        time.sleep(0.05)
+    else:
+        print("\n  [skip] HW VOLUME (sub 0x03) — jack headset path, "
+              "xone skips it (see SEND_HW_VOLUME)")
 
     return seq_ref
 
