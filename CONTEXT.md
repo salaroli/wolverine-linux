@@ -378,8 +378,10 @@ Probe sistemático de command IDs executado. Revelou:
 
 Port completo do driver Python para um **binário Rust único** (`rust/`, crate
 `wolverine-linux`, binário `wolverined`), mirando o produto final: sem
-interpretador, sem ctypes, sem shim C. **Todos os módulos implementados e
-validados no hardware** (áudio limpo + mic + gamepad + botões de mídia).
+interpretador, sem ctypes, sem shim C. **Driver feature-complete, validado no
+hardware:** áudio limpo (fones) + mic + gamepad (mapeamento correto + Guide) +
+botões de mídia + **rumble/force feedback**. Supera o Python (que não tinha rumble
+nem religava o xpad limpo no fim).
 
 ### Decisão de arquitetura: userspace **detacha e recria** o xpad (não coexiste)
 
@@ -438,6 +440,17 @@ mais complexo (código de kernel, ALSA, DKMS) — o userspace já funciona 100% 
   responde `VOLUME_CHAT` com volume de HW **no máximo** (`64 64 64`) e espelha
   `data[6]` no `@DEFAULT_AUDIO_SINK@` via `wpctl` — assim a atenuação real é do
   PipeWire, não do DAC (senão o controle trava em "100% ou mudo").
+- **Mapeamento do gamepad = layout xpad, não o do Python.** O `parse_and_forward_gamepad`
+  do Python estava **deslocado 1 bit** (ex.: `0x08` virava "A", quando é View/Select) e
+  media triggers/sticks errado. O correto é o layout Xbox One do `xpad` (fonte da verdade):
+  botões em `data[4]`/`data[5]`, gatilhos 10-bit (u16, 0..1023), sticks s16 com **Y invertido**,
+  dpad como HAT. O **botão Guide** não vem no bitmask — chega num pacote GIP próprio
+  (**cmd `0x07`**, `data[4]` bit0), igual xpad.
+- **Rumble:** GIP cmd **`0x09`**, payload estilo xpad `[00, 0f (motores), LT, RT, strong,
+  weak, ff (dur), 00, ff (loop)]`, `opts=0x00`. Confirmado no hardware (strong+weak vibram).
+  No lado Linux, o device uinput declara `FF_RUMBLE`; `poll_rumble()` lê os efeitos
+  (`UI_FF_UPLOAD`/play/erase) **não-bloqueante** (fd `O_NONBLOCK`) dentro do loop do EP1 —
+  sem thread extra — e manda o `0x09` na EP1 OUT, escalando magnitude 0..0xffff → 0..100.
 
 ### Como rodar
 
