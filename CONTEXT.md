@@ -154,7 +154,9 @@ capturado. É a próxima frente.
 3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito.*
 4. ✅ **Voz robótica corrigida** — iso assíncrono (usb1) **+ enquadramento GIP no OUT**. *Feito.* Ver seção dedicada.
 5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
-6. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot. **PRÓXIMO FOCO.**
+6. 🚧 **Rewrite em Rust** (branch `feat/rust-rewrite`) — driver único, nativo, sem
+   Python/ctypes/shim C. **Todos os módulos prontos e validados no hardware.** Ver seção dedicada.
+7. ⏳ **Daemon systemd** — empacotar o binário Rust (detach xpad, gamepad + botões + áudio) no boot.
 
 ## Botões de mídia — RESOLVIDO
 
@@ -369,6 +371,98 @@ Probe sistemático de command IDs executado. Revelou:
   - Address: `dd c7 39 dc b8 f6`
   - Vendor: 0x1532 (Razer)
   - FW version: 1.0.0.0
+
+---
+
+## Rewrite em Rust (`feat/rust-rewrite`) — arquitetura e decisões
+
+Port completo do driver Python para um **binário Rust único** (`rust/`, crate
+`wolverine-linux`, binário `wolverined`), mirando o produto final: sem
+interpretador, sem ctypes, sem shim C. **Driver feature-complete, validado no
+hardware:** áudio limpo (fones) + mic + gamepad (mapeamento correto + Guide) +
+botões de mídia + **rumble/force feedback**. Supera o Python (que não tinha rumble
+nem religava o xpad limpo no fim).
+
+### Decisão de arquitetura: userspace **detacha e recria** o xpad (não coexiste)
+
+Pergunta recorrente: "o áudio/controles é um driver separado do xpad, ou recria?"
+**Recria.** O `wolverined` **detacha o `xpad`** e assume as 3 interfaces; não roda
+ao lado do driver de kernel. Motivo: **tudo que o driver precisa passa pela mesma
+EP1 (interface 0)** que o xpad monopoliza:
+
+| O que | Onde chega |
+|---|---|
+| Reports do gamepad | EP1 (interface 0) — o que o xpad lia |
+| Handshake GIP (IDENTIFY, **POWER ON**, FORMAT) | EP1 — necessário pra ligar o áudio |
+| **Botões de mídia** (volume/mic mute) | EP1, como `AUDIO_CONTROL` sub 0x00 (mesmo canal do gamepad) |
+
+Como o xpad monopoliza a interface 0, não dá pra mandar `POWER ON` nem ler os
+botões de mídia com ele lá. Então o driver **detacha o xpad** e, como o gamepad
+deixa de ser tratado pelo kernel, **recria o gamepad via uinput** (lendo os
+reports GIP crus da EP1). No `Ctrl+C`/`SIGTERM`, o nusb **religa o xpad** e o
+kernel retoma o gamepad. É o mesmo que o driver Python já fazia — é a única forma
+no modelo userspace.
+
+**Alternativa (rota futura `driver/`):** um módulo de kernel estilo
+[xone](https://github.com/medusalix/xone) coexistiria "de dentro" (registrado no
+barramento GIP, sem detachar nada), tratando gamepad+áudio+mídia no kernel. Muito
+mais complexo (código de kernel, ALSA, DKMS) — o userspace já funciona 100% hoje.
+
+### Mapa de módulos (`rust/src/`)
+
+| Módulo | Papel | Biblioteca |
+|---|---|---|
+| `gip.rs` | Framing GIP (header/varints/seq), constantes, testes | — |
+| `usb.rs` | Handshake EP1 + event loop (gamepad/mídia/STATUS) | **nusb 0.1** (interrupt/bulk) |
+| `iso.rs` | Motor iso EP3 async (OUT GIP-framed + IN) | **libusb1-sys** (FFI) |
+| `audio.rs` | Sink+source PipeWire nativo | **pipewire-rs 0.10** |
+| `ring.rs` | Rings SPSC lock-free (ponte RT↔USB) | **rtrb** |
+| `input.rs` | uinput gamepad + teclado de mídia | **evdev 0.12** |
+| `main.rs` | Orquestração + shutdown limpo (SIGINT/SIGTERM) | — |
+
+### Decisões técnicas que custaram investigação (não repetir do zero)
+
+- **iso precisa de libusb, não nusb.** O `nusb` (0.1 **e** 0.2) **não expõe API
+  isócrona** — só bulk/interrupt. Por isso o EP3 usa `libusb1-sys` direto (FFI),
+  fiel ao `iso_audio.py` (python-libusb1). Resultado: **híbrido de dois handles**
+  no mesmo device — nusb dono das ifaces 0/2, libusb dono da iface 1. O handshake
+  GIP (EP1) roda **antes** do libusb pegar a iface 1 (ordem importa). Espelha o
+  híbrido pyusb+usb1 do Python. O `unsafe` fica isolado em `iso.rs`.
+- **pipewire-rs: usar 0.10, não 0.8.** A 0.8 (libspa) **não compila** contra o
+  PipeWire 1.6.6 do sistema (layout do `spa_pod_builder` mudou). A **0.10**
+  compila limpo. Isso deletou o shim C (`wolverine_pw.c`) — SPA format nativo.
+- **Rings: `rtrb` (SPSC lock-free) com drop-newest.** Diferente do C (drop-oldest,
+  mutex). O rtrb só deixa o *produtor* travar, então no overflow a gente descarta
+  o **mais novo**. OK com streams casados + priming; e tira o mutex do callback RT.
+- **evdev > input-linux.** Trocado `input-linux` por `evdev 0.12` (API de uinput
+  bem mais ergonômica: `VirtualDeviceBuilder` + `AttributeSet`).
+- **Botão de volume:** o firmware reporta volume **absoluto** em `data[6]`. O driver
+  responde `VOLUME_CHAT` com volume de HW **no máximo** (`64 64 64`) e espelha
+  `data[6]` no `@DEFAULT_AUDIO_SINK@` via `wpctl` — assim a atenuação real é do
+  PipeWire, não do DAC (senão o controle trava em "100% ou mudo").
+- **Mapeamento do gamepad = layout xpad, não o do Python.** O `parse_and_forward_gamepad`
+  do Python estava **deslocado 1 bit** (ex.: `0x08` virava "A", quando é View/Select) e
+  media triggers/sticks errado. O correto é o layout Xbox One do `xpad` (fonte da verdade):
+  botões em `data[4]`/`data[5]`, gatilhos 10-bit (u16, 0..1023), sticks s16 com **Y invertido**,
+  dpad como HAT. O **botão Guide** não vem no bitmask — chega num pacote GIP próprio
+  (**cmd `0x07`**, `data[4]` bit0), igual xpad.
+- **Rumble:** GIP cmd **`0x09`**, payload estilo xpad `[00, 0f (motores), LT, RT, strong,
+  weak, ff (dur), 00, ff (loop)]`, `opts=0x00`. Confirmado no hardware (strong+weak vibram).
+  No lado Linux, o device uinput declara `FF_RUMBLE`; `poll_rumble()` lê os efeitos
+  (`UI_FF_UPLOAD`/play/erase) **não-bloqueante** (fd `O_NONBLOCK`) dentro do loop do EP1 —
+  sem thread extra — e manda o `0x09` na EP1 OUT, escalando magnitude 0..0xffff → 0..100.
+
+### Como rodar
+
+```bash
+make -C tools               # (Python legado, ainda funciona)
+cd rust && cargo build --release
+sudo RUST_LOG=info ./target/release/wolverined   # driver completo
+sudo ./target/release/wolverined audio           # só o bridge PipeWire (sem USB), pra debug
+```
+
+O Python em `tools/` continua válido como referência/legado; o Rust é o caminho
+do produto final.
 
 ---
 
