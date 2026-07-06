@@ -16,8 +16,10 @@ O gamepad em si já funciona nativamente via driver `xpad` do kernel.
 | Áudio saída (fones) | ✅ **voz limpa** via PipeWire (sink *Wolverine Headphones*) — iso assíncrono + enquadramento GIP |
 | Áudio entrada (mic) | ✅ funciona via PipeWire (source *Wolverine Microphone*), formato **24kHz mono** confirmado |
 | Botões de mídia | ✅ volume + mic mute espelhados no PipeWire |
+| Rumble / force feedback | ✅ `FF_RUMBLE` → GIP rumble (cmd 0x09) |
 | ~~Voz robótica~~ (saída) | ✅ **RESOLVIDO** — a causa era **formato** (faltava header GIP no OUT), não timing (ver seção dedicada) |
 | ~~Buzz canal esquerdo~~ | ✅ **RESOLVIDO** — sumiu junto com o fix do enquadramento GIP; **não era hardware** (ver seção dedicada) |
+| ~~Latência de áudio~~ | ✅ **RESOLVIDO** — ring com bound no consumidor (drop-oldest) + mic respeita `requested`; baixa e ajustável (ver seção dedicada) |
 
 > **Marco (breakthrough):** o áudio do jack **funciona no Linux**. A conclusão
 > anterior de "limitação de hardware irreversível" estava **errada**. O elo perdido
@@ -154,10 +156,12 @@ capturado. É a próxima frente.
 3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito.*
 4. ✅ **Voz robótica corrigida** — iso assíncrono (usb1) **+ enquadramento GIP no OUT**. *Feito.* Ver seção dedicada.
 5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
-6. 🚧 **Rewrite em Rust** (branch `feat/rust-rewrite`) — driver único, nativo, sem
-   Python/ctypes/shim C. **Todos os módulos prontos e validados no hardware.** Ver seção dedicada.
+6. ✅ **Rewrite em Rust** — driver único, nativo, sem Python/ctypes/shim C.
+   **Todos os módulos prontos e validados no hardware.** *Feito.* Ver seção dedicada.
 7. ✅ **Daemon systemd** — `packaging/` tem unit + regra udev + `install.sh`. Ativado por
    udev (sobe no plug/boot, sai no unplug); mira a sessão PipeWire do usuário via `WOLVERINE_UID`.
+8. ✅ **Latência de áudio** — ring com bound no consumidor (drop-oldest) + mic respeita
+   `requested`; baixa e ajustável por env. *Feito.* Ver seção dedicada.
 
 ## Botões de mídia — RESOLVIDO
 
@@ -472,17 +476,19 @@ sudo ./target/release/wolverined audio           # só o bridge PipeWire (sem US
 O Python em `tools/` continua válido como referência/legado; o Rust é o caminho
 do produto final.
 
-### Estado atual (handoff) e próximos passos
+### Estado atual — SOLUÇÃO COMPLETA
 
 **Feito e validado no hardware:** driver Rust feature-complete (gamepad com mapa
 xpad + Guide, áudio limpo, mic, botões de mídia, rumble) **+ daemon systemd**
 (`packaging/`: unit + regra udev + `install.sh`, ativado por udev, ciclo de vida
-limpo no plug/unplug/replug).
+limpo no plug/unplug/replug) **+ latência de áudio resolvida** (baixa, sem corte,
+ajustável por env).
 
-**Estado do git:** `main` tem PR #1 (gip-init legado) e PR #2 (rewrite Rust)
-mergeados. **PR #3** (`feat/systemd-daemon`) aberta com o daemon, aguardando merge.
+**Estado do git:** `main` tem PRs #1–#4 mergeados (gip-init legado, rewrite Rust,
+daemon systemd). O **PR #5** (`fix/audio-latency`) fecha a latência de áudio — é o
+PR **final** da solução. Não há próximos passos pendentes.
 
-**🚧 EM ANDAMENTO — latência de áudio (voz sai atrasada).** Branch `fix/audio-latency`.
+**✅ RESOLVIDO — latência de áudio.** Branch `fix/audio-latency` (PR #5, final).
 
 ### ⚠️ CAUSA RAIZ (descoberta depois): ring ILIMITADO, não o piso
 
