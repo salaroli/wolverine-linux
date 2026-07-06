@@ -164,6 +164,11 @@ impl Device {
                 gip::cmd::INPUT => {
                     let _ = ui.forward_gamepad(&raw);
                 }
+                gip::cmd::VIRTUAL_KEY => {
+                    // Guide/Xbox button: its own packet, data[4] bit0 = pressed.
+                    let pressed = raw.get(4).copied().unwrap_or(0) & 0x01 != 0;
+                    let _ = ui.forward_guide(pressed);
+                }
                 gip::cmd::STATUS => {
                     let s = self.seq.next();
                     let status_val = raw.get(4).copied().unwrap_or(0x80);
@@ -195,7 +200,10 @@ impl Device {
                         let _ = self.send(pkt, "ACK");
                     }
                 }
-                _ => {}
+                other => {
+                    log::debug!("EP1 unhandled cmd=0x{other:02x} ({} bytes): {:02x?}",
+                        raw.len(), &raw[..raw.len().min(10)]);
+                }
             }
         }
         Ok(())

@@ -25,6 +25,9 @@ pub mod cmd {
     /// KEY TO AUDIO: with GIP_PWR_ON (0x00) wakes the audio subsystem.
     pub const POWER: u8 = 0x05;
     pub const AUTHENTICATE: u8 = 0x06;
+    /// Guide/Xbox button — arrives as its own packet, not in the INPUT bitmask.
+    /// `data[4]` bit0 = pressed (matches xpad).
+    pub const VIRTUAL_KEY: u8 = 0x07;
     pub const AUDIO_CONTROL: u8 = 0x08;
     pub const INPUT: u8 = 0x20;
     /// Isochronous audio samples (both OUT and IN are framed with this).

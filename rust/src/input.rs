@@ -153,6 +153,16 @@ impl Uinput {
         Ok(())
     }
 
+    /// Emit the Guide/Xbox button (GIP VIRTUAL_KEY 0x07 packet, data[4] bit0).
+    pub fn forward_guide(&mut self, pressed: bool) -> Result<()> {
+        self.gamepad.emit(&[InputEvent::new(
+            EventType::KEY,
+            Key::BTN_MODE.code(),
+            i32::from(pressed),
+        )])?;
+        Ok(())
+    }
+
     /// Handle an AUDIO_CONTROL sub-0x00 report (media buttons). Acts on changes
     /// only. Ported from `forward_media`.
     pub fn forward_media(&mut self, data: &[u8]) -> Result<()> {
@@ -210,6 +220,7 @@ fn build_gamepad() -> Result<VirtualDevice> {
     for &(_, k) in BTN_MAP {
         keys.insert(k);
     }
+    keys.insert(Key::BTN_MODE); // Guide/Xbox button (separate 0x07 packet)
     let stick = AbsInfo::new(0, -32768, 32767, 16, 128, 0);
     let trigger = AbsInfo::new(0, 0, 1023, 0, 0, 0); // Xbox One triggers are 10-bit
     let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
