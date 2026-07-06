@@ -27,7 +27,34 @@ mod iso;
 mod ring;
 mod usb;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use anyhow::Result;
+
+/// Set by SIGINT/SIGTERM so the main thread can unwind and run Drop (which
+/// stops the iso engine + PipeWire bridge and lets nusb reattach xpad).
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as usize);
+        libc::signal(libc::SIGTERM, on_signal as usize);
+    }
+}
+
+/// Block until SIGINT/SIGTERM, then return so Drop impls run.
+fn park_until_signal() {
+    install_signal_handlers();
+    while !STOP.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    log::info!("signal received — shutting down");
+}
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -64,11 +91,11 @@ fn main() -> Result<()> {
     log::info!("audio running — select 'Wolverine Headphones' / 'Wolverine Microphone'. Ctrl+C to stop.");
 
     // 6. Blocking event loop: gamepad + media buttons.  (input.rs — pending)
-    //    For now just park so the audio keeps flowing.
-    // dev.run_event_loop()?;
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    //    For now just park until Ctrl+C, keeping the audio flowing. On return,
+    //    `_iso` and `_bridge` drop: the iso engine stops, the bridge stops, and
+    //    nusb reattaches xpad — the gamepad comes back without a replug.
+    park_until_signal();
+    Ok(())
 }
 
 /// Audio-only smoke test (no USB): start the PipeWire bridge and park.
@@ -85,7 +112,6 @@ fn audio_smoke() -> Result<()> {
          Check `wpctl status`. Nothing drains the sink yet (no controller), \
          so playback just fills the ring and the mic outputs silence. Ctrl+C to exit."
     );
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    park_until_signal();
+    Ok(())
 }
