@@ -70,7 +70,16 @@ fn main() -> Result<()> {
     log::info!("wolverined starting");
 
     // 1. USB device + control interfaces, detach xpad.
-    let mut dev = usb::Device::open()?;
+    let mut dev = match usb::Device::open() {
+        Ok(d) => d,
+        Err(e) if e.to_string().contains("not found") => {
+            // Device absent: exit cleanly (0). Under systemd the udev rule
+            // restarts us when the controller is plugged in.
+            log::info!("Wolverine not connected — exiting (udev will start us on plug)");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     // 3. Audio bring-up on EP1 (IDENTIFY / AUDIO_FORMAT / POWER ON).
     //    This is the crown-jewel path: if POWER ON lands, the DAC/ADC wake up.

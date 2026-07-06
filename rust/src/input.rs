@@ -354,15 +354,23 @@ fn build_keyboard() -> Result<VirtualDevice> {
         .map_err(|e| anyhow!("build media keyboard uinput: {e}"))
 }
 
-/// Run `wpctl` as the invoking user — PipeWire lives in that user's session, not
-/// root's. Uses SUDO_USER / SUDO_UID (set by sudo). Best-effort. Blocking, but
-/// media-button events are rare so this doesn't hold up the gamepad path.
+/// Run `wpctl` as the desktop user — PipeWire lives in that user's session, not
+/// root's. The uid comes from SUDO_UID (sudo) or WOLVERINE_UID (systemd unit);
+/// `sudo -u #<uid>` works without needing the username. Best-effort. Blocking,
+/// but media-button events are rare so this doesn't hold up the gamepad path.
 fn wpctl(args: &[&str]) {
     let euid = unsafe { libc::geteuid() };
-    let mut cmd = match (euid == 0, std::env::var("SUDO_USER"), std::env::var("SUDO_UID")) {
-        (true, Ok(user), Ok(uid)) => {
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .or_else(|| std::env::var("WOLVERINE_UID").ok());
+    let mut cmd = match (euid == 0, uid) {
+        (true, Some(uid)) => {
             let mut c = std::process::Command::new("sudo");
-            c.arg("-u").arg(user).arg("env").arg(format!("XDG_RUNTIME_DIR=/run/user/{uid}")).arg("wpctl");
+            c.arg("-u")
+                .arg(format!("#{uid}"))
+                .arg("env")
+                .arg(format!("XDG_RUNTIME_DIR=/run/user/{uid}"))
+                .arg("wpctl");
             c
         }
         _ => std::process::Command::new("wpctl"),

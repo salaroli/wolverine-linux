@@ -117,11 +117,15 @@ impl Drop for Bridge {
     }
 }
 
-/// The daemon runs as root (sudo) but PipeWire lives in the invoking user's
-/// session. Point XDG_RUNTIME_DIR at /run/user/<SUDO_UID> so pw connects to the
-/// user's socket instead of root's (mirrors the Python driver's SUDO_UID logic).
+/// The driver runs as root but PipeWire lives in the desktop user's session.
+/// Point XDG_RUNTIME_DIR at /run/user/<uid> so pw connects to the user's socket
+/// instead of root's. The uid comes from SUDO_UID (when run via `sudo`) or
+/// WOLVERINE_UID (set by the systemd unit).
 fn point_at_user_session() {
-    if let Ok(uid) = std::env::var("SUDO_UID") {
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .or_else(|| std::env::var("WOLVERINE_UID").ok());
+    if let Some(uid) = uid {
         let dir = format!("/run/user/{uid}");
         if std::path::Path::new(&dir).exists() {
             std::env::set_var("XDG_RUNTIME_DIR", &dir);
@@ -144,7 +148,25 @@ fn run_pw(
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+
+    // The user's PipeWire may not be up yet at boot (udev-started daemon racing
+    // the session). Retry the connection for a few seconds before giving up.
+    let core = {
+        let mut attempt = 0;
+        loop {
+            match context.connect_rc(None) {
+                Ok(core) => break core,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 20 {
+                        return Err(e);
+                    }
+                    log::warn!("PipeWire not ready (attempt {attempt}); retrying…");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    };
 
     let in_stride = (in_channels as usize) * std::mem::size_of::<i16>();
 
