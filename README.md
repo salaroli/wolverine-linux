@@ -79,6 +79,29 @@ cargo run --release -- audio
 > (via `SUDO_UID` / `XDG_RUNTIME_DIR`), so the devices show up in your normal
 > audio settings.
 
+## Install as a service (systemd + udev)
+
+To have the driver start automatically whenever the controller is plugged in:
+
+```bash
+sudo ./packaging/install.sh
+```
+
+This builds the release binary, installs it to `/usr/local/bin/wolverined`, and
+sets up a **udev-activated** systemd service targeting your user's PipeWire
+session. The service starts on connect (at boot or hotplug) and the daemon exits
+by itself on disconnect.
+
+```bash
+systemctl status wolverined        # is it running?
+journalctl -u wolverined -f        # live logs
+systemctl stop wolverined          # stop and hand the gamepad back to xpad
+```
+
+Uninstall: remove `/usr/local/bin/wolverined`,
+`/etc/systemd/system/wolverined.service` and
+`/etc/udev/rules.d/99-wolverine.rules`, then `systemctl daemon-reload`.
+
 ## Layout
 
 ```
@@ -92,6 +115,7 @@ wolverine-linux/
 │       ├── ring.rs        # lock-free SPSC audio rings (rtrb)
 │       ├── input.rs       # uinput gamepad + media keys + rumble (evdev)
 │       └── main.rs        # orchestration + clean shutdown
+├── packaging/             # systemd unit + udev rule + install.sh
 ├── tools/                 # Python reference implementation (legacy)
 ├── docs/usb-analysis.md
 └── CONTEXT.md             # protocol knowledge base & design decisions

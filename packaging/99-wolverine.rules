@@ -1,0 +1,4 @@
+# Start the Wolverine driver when the controller (1532:0a14) is connected —
+# fires at boot coldplug and on hotplug. The daemon exits by itself when the
+# device is removed.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1532", ATTR{idProduct}=="0a14", TAG+="systemd", ENV{SYSTEMD_WANTS}+="wolverined.service"

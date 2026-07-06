@@ -156,7 +156,8 @@ capturado. É a próxima frente.
 5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
 6. 🚧 **Rewrite em Rust** (branch `feat/rust-rewrite`) — driver único, nativo, sem
    Python/ctypes/shim C. **Todos os módulos prontos e validados no hardware.** Ver seção dedicada.
-7. ⏳ **Daemon systemd** — empacotar o binário Rust (detach xpad, gamepad + botões + áudio) no boot.
+7. ✅ **Daemon systemd** — `packaging/` tem unit + regra udev + `install.sh`. Ativado por
+   udev (sobe no plug/boot, sai no unplug); mira a sessão PipeWire do usuário via `WOLVERINE_UID`.
 
 ## Botões de mídia — RESOLVIDO
 
@@ -451,6 +452,13 @@ mais complexo (código de kernel, ALSA, DKMS) — o userspace já funciona 100% 
   No lado Linux, o device uinput declara `FF_RUMBLE`; `poll_rumble()` lê os efeitos
   (`UI_FF_UPLOAD`/play/erase) **não-bloqueante** (fd `O_NONBLOCK`) dentro do loop do EP1 —
   sem thread extra — e manda o `0x09` na EP1 OUT, escalando magnitude 0..0xffff → 0..100.
+- **Daemon systemd (`packaging/`):** sob systemd **não existe `SUDO_UID`**, então a sessão
+  PipeWire do usuário é mirada via **`WOLVERINE_UID`** (setado pelo unit; `audio.rs` aponta
+  `XDG_RUNTIME_DIR`, e o `wpctl` roda como `sudo -u #<uid>` — sem precisar do nome). Ativação
+  por **udev** (`SYSTEMD_WANTS` no `add` do 1532:0a14) cobre boot-coldplug + hotplug. Quando o
+  controle está ausente o `main` sai **0** (não erro), pra o `Restart=on-failure` não entrar em
+  loop — o udev religa no plug. `audio.rs` faz **retry** de conexão ao PipeWire (~10s) pro caso
+  da sessão do usuário ainda não estar pronta no boot.
 
 ### Como rodar
 

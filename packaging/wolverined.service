@@ -1,0 +1,20 @@
+[Unit]
+Description=Razer Wolverine Ultimate userspace driver (gamepad, audio, media, rumble)
+Documentation=https://github.com/salaroli/wolverine-linux
+
+[Service]
+Type=simple
+# The driver runs as root (detaches xpad, claims the USB interfaces, creates the
+# uinput devices) but talks to the desktop user's PipeWire session. install.sh
+# substitutes __UID__ with the installing user's uid; edit here for another user.
+Environment=WOLVERINE_UID=__UID__
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/wolverined
+# Restart on crash, but NOT on clean exit: when the controller is absent the
+# daemon exits 0, and the udev rule re-starts it on plug (see 99-wolverine.rules).
+Restart=on-failure
+RestartSec=3
+
+# This unit is activated by udev (ENV{SYSTEMD_WANTS}) on controller connect —
+# no [Install]/WantedBy needed; udev covers both coldplug at boot and hotplug.

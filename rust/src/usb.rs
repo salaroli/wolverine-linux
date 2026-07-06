@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use async_io::Timer;
 use futures_lite::future::{block_on, or};
-use nusb::transfer::{Completion, RequestBuffer, ResponseBuffer};
+use nusb::transfer::{Completion, RequestBuffer, ResponseBuffer, TransferError};
 use nusb::Interface;
 
 use crate::gip;
@@ -34,6 +34,13 @@ pub const EP3_IN: u8 = 0x83; // isochronous, interface 1 (audio) — see iso.rs
 pub const EP3_OUT: u8 = 0x03;
 
 const TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Result of an EP1 IN read: data, a benign timeout, or device removal.
+enum Ep1Read {
+    Data(Vec<u8>),
+    Timeout,
+    Disconnected,
+}
 
 /// Handle to the opened Wolverine, owning the control interfaces (0 and 2).
 pub struct Device {
@@ -163,7 +170,11 @@ impl Device {
             }
 
             let raw = match self.recv(Duration::from_millis(100)) {
-                Some(r) if !r.is_empty() => r,
+                Ep1Read::Data(r) if !r.is_empty() => r,
+                Ep1Read::Disconnected => {
+                    log::info!("controller disconnected — shutting down");
+                    break;
+                }
                 _ => continue,
             };
             let cmd = raw[0];
@@ -240,8 +251,8 @@ impl Device {
         }
     }
 
-    /// Read one packet (≤64B) from EP1 IN, up to `timeout`. `None` on timeout.
-    fn recv(&self, timeout: Duration) -> Option<Vec<u8>> {
+    /// Read one packet (≤64B) from EP1 IN, up to `timeout`.
+    fn recv(&self, timeout: Duration) -> Ep1Read {
         let fut = self.gip.interrupt_in(EP1_IN, RequestBuffer::new(64));
         let res: Option<Completion<Vec<u8>>> = block_on(or(
             async move { Some(fut.await) },
@@ -251,8 +262,12 @@ impl Device {
             },
         ));
         match res {
-            Some(c) if c.status.is_ok() => Some(c.data),
-            _ => None,
+            Some(c) => match c.status {
+                Ok(()) => Ep1Read::Data(c.data),
+                Err(TransferError::Disconnected) => Ep1Read::Disconnected,
+                Err(_) => Ep1Read::Timeout, // transient (stall/fault) — retry
+            },
+            None => Ep1Read::Timeout,
         }
     }
 
@@ -261,7 +276,7 @@ impl Device {
         let deadline = Instant::now() + total;
         while Instant::now() < deadline {
             let to = (deadline - Instant::now()).min(Duration::from_millis(100));
-            if self.recv(to).is_none() {
+            if !matches!(self.recv(to), Ep1Read::Data(_)) {
                 break;
             }
         }
@@ -269,7 +284,7 @@ impl Device {
 
     /// Best-effort: read one response and log its command, for diagnostics.
     fn log_response(&self, label: &str) {
-        if let Some(raw) = self.recv(TIMEOUT) {
+        if let Ep1Read::Data(raw) = self.recv(TIMEOUT) {
             if let Some(pkt) = gip::decode(&raw) {
                 log::info!("{label} ← cmd=0x{:02x} seq={} ({}B)", pkt.cmd, pkt.seq, raw.len());
             }
@@ -290,8 +305,8 @@ impl Device {
         while Instant::now() < deadline {
             let to = (deadline - Instant::now()).min(Duration::from_millis(300));
             let raw = match self.recv(to) {
-                Some(r) => r,
-                None => {
+                Ep1Read::Data(r) => r,
+                _ => {
                     if recvd > 0 {
                         break; // got data, timeout means transfer done
                     }
