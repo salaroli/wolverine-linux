@@ -41,9 +41,10 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 fn install_signal_handlers() {
+    let handler = on_signal as *const () as usize;
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as usize);
-        libc::signal(libc::SIGTERM, on_signal as usize);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 
