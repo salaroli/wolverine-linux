@@ -505,9 +505,31 @@ explicação nesta arquitetura: **o ring buffer enche e fica cheio**.
 de cada ring drena o excesso pra manter só os ~`target` bytes mais frescos:
 - **Playback** (`iso.rs` `on_out`): trima acima de `prime_bytes + histerese` → volta pra ~priming.
 - **Mic** (`audio.rs` source `process`): trima acima de `cap_high` → alvo `WOLVERINE_CAP_MS`
-  (default 40ms). Na primeira captura do Discord, o ring cheio é aparado num tranco → latência
+  (default 100ms). Na primeira captura do Discord, o ring cheio é aparado num tranco → latência
   corrigida já no primeiro buffer.
 - Diagnóstico: o log `[iso]` agora mostra `…B trimmed/5s` (quanto drift está sendo aparado).
+
+### ⚠️ Regressão do primeiro fix: mic cortava na primeira sílaba (RESOLVIDO)
+
+Depois do trim, os segundos sumiram mas o mic passou a **cortar** — só a primeira sílaba
+da fala passava. Duas causas somadas no `process` do source:
+1. O callback lia `slice.len()` (= **maxsize**, o buffer mapeado inteiro) todo ciclo e
+   **ignorava `pw_buffer.requested`** (os frames que o PipeWire quer no quantum). O shim C
+   (`on_process_capture`) usa `requested`; o Rust não usava.
+2. O trim esvaziava o ring do mic até `cap_low` (40ms). Como `want`(maxsize) > 40ms, cada
+   ciclo lia ~40ms reais e **preenchia o resto com silêncio** → primeira sílaba e depois nada.
+
+**Fix (mesma branch):**
+- `Cargo.toml`: habilitar feature **`v0_3_49`** do pipewire-rs → expõe `Buffer::requested()`
+  (encadeia `spa/v0_3_33`, compatível com o 1.6.6). Compila limpo.
+- `audio.rs` source `process`: **respeitar `requested`** (`want = requested*stride`, clamp em
+  maxsize; fallback maxsize se 0) e tornar o trim **want-aware** — `low = max(cap_low, want)`,
+  `high = max(cap_high, 2*want)`. Garante que o ring nunca fica **abaixo** do que a leitura
+  precisa → sem gutting, independente de `requested`. Default `WOLVERINE_CAP_MS` 40 → **100**.
+
+**Lição:** um consumidor PipeWire não deve encher `maxsize` cego — usar `requested` (frames
+do quantum), como o driver de referência. E um bound de latência no consumidor **nunca** pode
+deixar menos que uma leitura precisa, senão vira silêncio.
 
 **Lição (a mesma do projeto):** medir o sintoma real antes de afinar. "Latência alta" tem
 duas causas ortogonais — piso (buffers de pipeline, ms) e teto (ring sem bound, segundos).
