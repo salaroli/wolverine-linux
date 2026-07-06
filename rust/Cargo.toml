@@ -37,7 +37,7 @@ pipewire = "0.10"
 libspa = "0.10"
 
 # uinput — re-expose the gamepad and a separate keyboard-only device for media keys.
-input-linux = "0.7"
+evdev = "0.12"
 
 # Lock-free SPSC ring buffer for the RT-audio <-> USB bridge (replaces the C
 # mutex + drop-on-overflow rings). One per direction.

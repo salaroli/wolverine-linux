@@ -1,55 +1,224 @@
 //! uinput layer: re-expose the gamepad and handle the media buttons.
+//! Port of the uinput + forward_* logic in gip_init.py, using the `evdev` crate.
 //!
-//! Two virtual devices (mirrors gip_init.py):
+//! Two virtual devices:
 //!   - gamepad  : ABS + BTN, fed from GIP INPUT (0x20) reports.
-//!   - keyboard : KEY_* only. MUST be separate — libinput classifies the
-//!                gamepad (ABS+BTN) as a joystick and would swallow KEY_* events
-//!                emitted from it. A pure-keyboard device is delivered as a real
-//!                keyboard to the compositor.
+//!   - keyboard : KEY_* only. MUST be separate — libinput classifies a device
+//!                with ABS axes + gamepad buttons as a joystick and does NOT
+//!                deliver its KEY_* events to Wayland compositors. A pure-KEY
+//!                device is seen as a keyboard, so media keys reach Hyprland.
 //!
 //! Media buttons arrive as AUDIO_CONTROL sub 0x00 (VOLUME_CHAT) on EP1:
 //!   data[5] = mic mute state (0x04 unmuted / 0x05 muted)
 //!   data[6] = absolute volume (0x00..0x64 = 0..100)
-//! The firmware tracks state and reports only the resulting absolute volume, so
-//! no "hold" logic is needed — just track the direction of data[6] changes.
+//! The firmware tracks an absolute volume; a click bumps it up, hold + D-pad
+//! down lowers it. We act on *changes* only (the first report is a baseline).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use evdev::{
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, Key,
+    UinputAbsSetup,
+};
+use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
+
+use crate::gip;
 
 /// How media buttons are surfaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaMode {
-    /// Default: mirror to PipeWire (sink volume + source mute) 1:1. In Rust we
-    /// set volume/mute directly on the graph via the PipeWire client (audio.rs)
-    /// instead of shelling out to `wpctl` as the Python version does.
+    /// Default: mirror the controller's absolute volume/mute to the system's
+    /// default sink/source via `wpctl` (the knob becomes the system slider).
     Absolute,
-    /// Emit KEY_VOLUMEUP/DOWN + KEY_MICMUTE from the keyboard device.
+    /// Emit relative KEY_VOLUMEUP/DOWN + KEY_MICMUTE from the keyboard device.
     Keys,
 }
 
+/// Gamepad buttons in report-bit order (mask, key). Ported from `btn_map`.
+/// evdev uses the SOUTH/EAST/NORTH/WEST names: A/B/X/Y respectively.
+const BTN_MAP: &[(u16, Key)] = &[
+    (0x0001, Key::BTN_SELECT),
+    (0x0002, Key::BTN_MODE),
+    (0x0004, Key::BTN_START),
+    (0x0008, Key::BTN_SOUTH), // A
+    (0x0010, Key::BTN_EAST),  // B
+    (0x0020, Key::BTN_NORTH), // X
+    (0x0040, Key::BTN_WEST),  // Y
+    (0x0100, Key::BTN_TL),
+    (0x0200, Key::BTN_TR),
+    (0x1000, Key::BTN_THUMBL),
+    (0x2000, Key::BTN_THUMBR),
+];
+
 pub struct Uinput {
-    // TODO: input-linux UInputHandle for gamepad and keyboard.
-    _private: (),
+    gamepad: VirtualDevice,
+    keyboard: VirtualDevice,
+    mode: MediaMode,
+    last_mute: Option<u8>,
+    last_vol: Option<u8>,
 }
 
 impl Uinput {
-    /// Create both virtual devices.
-    pub fn create() -> Result<Self> {
-        anyhow::bail!("input::Uinput::create not implemented yet")
+    /// Create both virtual devices (gamepad + media keyboard).
+    pub fn create(mode: MediaMode) -> Result<Self> {
+        let gamepad = build_gamepad()?;
+        let keyboard = build_keyboard()?;
+        log::info!("uinput devices created (gamepad + media keyboard)");
+        Ok(Self {
+            gamepad,
+            keyboard,
+            mode,
+            last_mute: None,
+            last_vol: None,
+        })
     }
 
     /// Translate a GIP INPUT (0x20) report into gamepad ABS/BTN events.
-    /// TODO: map the 14-byte payload (buttons, sticks, triggers, dpad, guide).
-    pub fn forward_gamepad(&mut self, _payload: &[u8]) -> Result<()> {
+    /// Payload layout (after the 4-byte GIP header): u16 buttons, u8 LT, u8 RT,
+    /// i16 LX, i16 LY, i16 RX, i16 RY. Ported from `parse_and_forward_gamepad`.
+    pub fn forward_gamepad(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < 4 + 12 {
+            return Ok(());
+        }
+        let p = &data[4..];
+        let buttons = u16::from_le_bytes([p[0], p[1]]);
+        let lt = p[2] as i32;
+        let rt = p[3] as i32;
+        let lx = i16::from_le_bytes([p[4], p[5]]) as i32;
+        let ly = i16::from_le_bytes([p[6], p[7]]) as i32;
+        let rx = i16::from_le_bytes([p[8], p[9]]) as i32;
+        let ry = i16::from_le_bytes([p[10], p[11]]) as i32;
+
+        let mut events = Vec::with_capacity(BTN_MAP.len() + 6);
+        for &(mask, key) in BTN_MAP {
+            let pressed = if buttons & mask != 0 { 1 } else { 0 };
+            events.push(InputEvent::new(EventType::KEY, key.code(), pressed));
+        }
+        for (axis, val) in [
+            (AbsoluteAxisType::ABS_X, lx),
+            (AbsoluteAxisType::ABS_Y, ly),
+            (AbsoluteAxisType::ABS_Z, lt),
+            (AbsoluteAxisType::ABS_RX, rx),
+            (AbsoluteAxisType::ABS_RY, ry),
+            (AbsoluteAxisType::ABS_RZ, rt),
+        ] {
+            events.push(InputEvent::new(EventType::ABSOLUTE, axis.0, val));
+        }
+        self.gamepad.emit(&events)?; // auto-appends SYN_REPORT
         Ok(())
     }
 
-    /// Handle an AUDIO_CONTROL sub-0x00 report (media buttons).
-    ///
-    /// Acts only on *changes*; the first report is a baseline so that merely
-    /// connecting doesn't yank the system volume. `mode` decides between
-    /// mirroring to PipeWire (Absolute) or emitting media keys (Keys).
-    pub fn forward_media(&mut self, _data: &[u8], _mode: MediaMode) -> Result<()> {
-        // data[5] = mic mute, data[6] = absolute volume (see module docs).
+    /// Handle an AUDIO_CONTROL sub-0x00 report (media buttons). Acts on changes
+    /// only. Ported from `forward_media`.
+    pub fn forward_media(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < 7 {
+            return Ok(());
+        }
+        let mute = data[5];
+        let vol = data[6];
+        let muted = mute == 0x05;
+
+        if let Some(prev) = self.last_mute {
+            if mute != prev {
+                match self.mode {
+                    MediaMode::Absolute => {
+                        wpctl(&["set-mute", "@DEFAULT_AUDIO_SOURCE@", if muted { "1" } else { "0" }]);
+                    }
+                    MediaMode::Keys => self.tap_key(Key::KEY_MICMUTE),
+                }
+                log::info!("media: MIC {}", if muted { "muted" } else { "unmuted" });
+            }
+        }
+        self.last_mute = Some(mute);
+
+        if let Some(prev) = self.last_vol {
+            if vol != prev {
+                match self.mode {
+                    MediaMode::Absolute => {
+                        // Snap the default sink to the controller's absolute level.
+                        wpctl(&["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", &format!("{:.2}", vol as f32 / 100.0)]);
+                    }
+                    MediaMode::Keys => {
+                        let key = if vol > prev { Key::KEY_VOLUMEUP } else { Key::KEY_VOLUMEDOWN };
+                        self.tap_key(key);
+                    }
+                }
+                log::info!("media: VOL {}→{} ({}%)", prev, vol, vol);
+            }
+        }
+        self.last_vol = Some(vol);
         Ok(())
     }
+
+    fn tap_key(&mut self, key: Key) {
+        let _ = self
+            .keyboard
+            .emit(&[InputEvent::new(EventType::KEY, key.code(), 1)]);
+        let _ = self
+            .keyboard
+            .emit(&[InputEvent::new(EventType::KEY, key.code(), 0)]);
+    }
+}
+
+fn build_gamepad() -> Result<VirtualDevice> {
+    let mut keys = AttributeSet::<Key>::new();
+    for &(_, k) in BTN_MAP {
+        keys.insert(k);
+    }
+    let stick = AbsInfo::new(0, -32768, 32767, 16, 128, 0);
+    let trigger = AbsInfo::new(0, 0, 255, 0, 0, 0);
+    let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
+
+    let mut builder = VirtualDeviceBuilder::new()?
+        .name("Razer Wolverine Ultimate")
+        .input_id(InputId::new(BusType::BUS_USB, gip::VID, gip::PID, 0x0101))
+        .with_keys(&keys)?;
+    for (axis, info) in [
+        (AbsoluteAxisType::ABS_X, stick),
+        (AbsoluteAxisType::ABS_Y, stick),
+        (AbsoluteAxisType::ABS_Z, trigger),
+        (AbsoluteAxisType::ABS_RX, stick),
+        (AbsoluteAxisType::ABS_RY, stick),
+        (AbsoluteAxisType::ABS_RZ, trigger),
+        (AbsoluteAxisType::ABS_HAT0X, hat),
+        (AbsoluteAxisType::ABS_HAT0Y, hat),
+    ] {
+        builder = builder.with_absolute_axis(&UinputAbsSetup::new(axis, info))?;
+    }
+    builder.build().map_err(|e| anyhow!("build gamepad uinput: {e}"))
+}
+
+fn build_keyboard() -> Result<VirtualDevice> {
+    let mut keys = AttributeSet::<Key>::new();
+    for k in [
+        Key::KEY_VOLUMEUP,
+        Key::KEY_VOLUMEDOWN,
+        Key::KEY_MUTE,
+        Key::KEY_MICMUTE,
+    ] {
+        keys.insert(k);
+    }
+    VirtualDeviceBuilder::new()?
+        .name("Razer Wolverine Ultimate Media Keys")
+        .input_id(InputId::new(BusType::BUS_USB, gip::VID, gip::PID, 0x0101))
+        .with_keys(&keys)?
+        .build()
+        .map_err(|e| anyhow!("build media keyboard uinput: {e}"))
+}
+
+/// Run `wpctl` as the invoking user — PipeWire lives in that user's session, not
+/// root's. Uses SUDO_USER / SUDO_UID (set by sudo). Best-effort. Blocking, but
+/// media-button events are rare so this doesn't hold up the gamepad path.
+fn wpctl(args: &[&str]) {
+    let euid = unsafe { libc::geteuid() };
+    let mut cmd = match (euid == 0, std::env::var("SUDO_USER"), std::env::var("SUDO_UID")) {
+        (true, Ok(user), Ok(uid)) => {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("-u").arg(user).arg("env").arg(format!("XDG_RUNTIME_DIR=/run/user/{uid}")).arg("wpctl");
+            c
+        }
+        _ => std::process::Command::new("wpctl"),
+    };
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let _ = cmd.status();
 }

@@ -89,13 +89,17 @@ fn main() -> Result<()> {
     //    handshake). Bridges the PipeWire rings to EP3 OUT/IN.
     let _iso = iso::IsoAudio::start(bus, addr, rings.playback, rings.capture)?;
 
-    log::info!("audio running — select 'Wolverine Headphones' / 'Wolverine Microphone'. Ctrl+C to stop.");
+    // 2. Virtual input devices (gamepad + media keyboard).
+    let mut uinput = input::Uinput::create(input::MediaMode::Absolute)?;
 
-    // 6. Blocking event loop: gamepad + media buttons.  (input.rs — pending)
-    //    For now just park until Ctrl+C, keeping the audio flowing. On return,
-    //    `_iso` and `_bridge` drop: the iso engine stops, the bridge stops, and
-    //    nusb reattaches xpad — the gamepad comes back without a replug.
-    park_until_signal();
+    log::info!("running — select 'Wolverine Headphones' / 'Wolverine Microphone'. Ctrl+C to stop.");
+
+    // 6. Blocking EP1 event loop: gamepad + media buttons, until SIGINT/SIGTERM.
+    //    On return, `_iso` and `_bridge` drop (iso stops, bridge stops) and nusb
+    //    reattaches xpad — the gamepad comes back without a replug.
+    install_signal_handlers();
+    dev.run_event_loop(&mut uinput, &STOP)?;
+    log::info!("shutting down");
     Ok(())
 }
 

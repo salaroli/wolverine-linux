@@ -13,6 +13,7 @@
 //! from a clone of the same nusb::Device — the GIP handshake on EP1 MUST happen
 //! BEFORE the iso engine grabs interface 1 and flips it to alt=1.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -22,6 +23,7 @@ use nusb::transfer::{Completion, RequestBuffer, ResponseBuffer};
 use nusb::Interface;
 
 use crate::gip;
+use crate::input::Uinput;
 
 // Endpoint addresses (bEndpointAddress from the descriptors).
 pub const EP1_IN: u8 = 0x81; // interrupt, interface 0 (GIP / gamepad)
@@ -142,12 +144,61 @@ impl Device {
         Ok(())
     }
 
-    /// Poll EP1 IN (gamepad INPUT 0x20 + AUDIO_CONTROL media buttons) and EP2 IN
-    /// (control/bulk). Dispatches to the uinput layer (input.rs).
-    ///
-    /// TODO(input): wire to input::Uinput once that module lands.
-    pub fn run_event_loop(&mut self) -> Result<()> {
-        anyhow::bail!("usb::Device::run_event_loop not implemented yet (needs input.rs)")
+    /// Poll EP1 IN and dispatch (ported from `monitor_gip`): INPUT (0x20) →
+    /// gamepad; STATUS (0x03) → heartbeat reply; AUDIO_CONTROL (0x08) sub 0x00 →
+    /// media buttons (mirror to system) + VOLUME_CHAT reply (keep the controller
+    /// HW volume at max so the system slider does the attenuation) + ACK. Runs
+    /// until `stop` is set (SIGINT/SIGTERM).
+    pub fn run_event_loop(&mut self, ui: &mut Uinput, stop: &AtomicBool) -> Result<()> {
+        log::info!("monitoring EP1 (gamepad + media buttons)");
+        while !stop.load(Ordering::Relaxed) {
+            let raw = match self.recv(Duration::from_millis(100)) {
+                Some(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+            let cmd = raw[0];
+            let opts = raw.get(1).copied().unwrap_or(0);
+            let seq = raw.get(2).copied().unwrap_or(0);
+
+            match cmd {
+                gip::cmd::INPUT => {
+                    let _ = ui.forward_gamepad(&raw);
+                }
+                gip::cmd::STATUS => {
+                    let s = self.seq.next();
+                    let status_val = raw.get(4).copied().unwrap_or(0x80);
+                    let pkt = gip::build_packet(
+                        gip::cmd::STATUS,
+                        gip::OPTS_INTERNAL,
+                        s,
+                        &[status_val, 0, 0, 0],
+                    );
+                    let _ = self.send(pkt, "STATUS");
+                }
+                gip::cmd::AUDIO_CONTROL => {
+                    let sub = raw.get(4).copied().unwrap_or(0xff);
+                    if sub == gip::AUDIO_CTRL_VOLUME_CHAT && raw.len() >= 9 {
+                        let state = raw[5];
+                        let _ = ui.forward_media(&raw);
+                        // Reply with max HW volumes so the controller's DAC stays
+                        // at full and the PipeWire slider does the attenuation.
+                        let s = self.seq.next();
+                        let payload = [gip::AUDIO_CTRL_VOLUME_CHAT, state, 0x64, 0x64, 0x64];
+                        let pkt =
+                            gip::build_packet(gip::cmd::AUDIO_CONTROL, gip::OPTS_INTERNAL, s, &payload);
+                        let _ = self.send(pkt, "VOLUME_CHAT");
+                    }
+                    if opts & gip::opt::ACK != 0 {
+                        let payload = [0x00, cmd, opts, 0, 0, 0, 0, 0, 0];
+                        let pkt =
+                            gip::build_packet(gip::cmd::ACKNOWLEDGE, gip::opt::INTERNAL, seq, &payload);
+                        let _ = self.send(pkt, "ACK");
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     // --- transfer helpers (EP1) ---
