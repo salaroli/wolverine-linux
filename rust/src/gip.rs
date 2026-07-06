@@ -29,6 +29,8 @@ pub mod cmd {
     /// `data[4]` bit0 = pressed (matches xpad).
     pub const VIRTUAL_KEY: u8 = 0x07;
     pub const AUDIO_CONTROL: u8 = 0x08;
+    /// Rumble/force-feedback command (host → device). Payload mirrors xpad.
+    pub const RUMBLE: u8 = 0x09;
     pub const INPUT: u8 = 0x20;
     /// Isochronous audio samples (both OUT and IN are framed with this).
     pub const AUDIO_SAMPLES: u8 = 0x60;

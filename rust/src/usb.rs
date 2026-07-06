@@ -152,6 +152,16 @@ impl Device {
     pub fn run_event_loop(&mut self, ui: &mut Uinput, stop: &AtomicBool) -> Result<()> {
         log::info!("monitoring EP1 (gamepad + media buttons)");
         while !stop.load(Ordering::Relaxed) {
+            // Drain any pending rumble (force-feedback) request and send it to the
+            // controller. Non-blocking; runs each iteration (≈gamepad report rate).
+            if let Some((strong, weak)) = ui.poll_rumble() {
+                let s = self.seq.next();
+                // xpad-style: [0x00, motor mask (all), LT, RT, strong, weak, dur, delay, loop]
+                let payload = [0x00, 0x0f, 0x00, 0x00, strong, weak, 0xff, 0x00, 0xff];
+                let pkt = gip::build_packet(gip::cmd::RUMBLE, 0x00, s, &payload);
+                let _ = self.send(pkt, "RUMBLE");
+            }
+
             let raw = match self.recv(Duration::from_millis(100)) {
                 Some(r) if !r.is_empty() => r,
                 _ => continue,

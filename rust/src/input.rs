@@ -14,14 +14,21 @@
 //! The firmware tracks an absolute volume; a click bumps it up, hold + D-pad
 //! down lowers it. We act on *changes* only (the first report is a baseline).
 
+use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
+
 use anyhow::{anyhow, Result};
-use evdev::{
-    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, Key,
-    UinputAbsSetup,
-};
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
+use evdev::{
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, FFEffectKind, FFEffectType,
+    InputEvent, InputEventKind, InputId, Key, UinputAbsSetup,
+};
 
 use crate::gip;
+
+// UInput force-feedback event codes (from linux/uinput.h).
+const UI_FF_UPLOAD: u16 = 1;
+const UI_FF_ERASE: u16 = 2;
 
 /// How media buttons are surfaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +76,9 @@ pub struct Uinput {
     last_mute: Option<u8>,
     last_vol: Option<u8>,
     last_buttons: Option<u16>,
+    /// Uploaded rumble effects: id → (strong, weak) magnitudes (0..=0xffff).
+    ff_effects: HashMap<i16, (u16, u16)>,
+    next_effect_id: i16,
 }
 
 impl Uinput {
@@ -84,7 +94,68 @@ impl Uinput {
             last_mute: None,
             last_vol: None,
             last_buttons: None,
+            ff_effects: HashMap::new(),
+            next_effect_id: 0,
         })
+    }
+
+    /// Non-blocking: drain force-feedback requests from the gamepad device and
+    /// return the rumble command to send to the controller, if any.
+    ///
+    /// The kernel/game uploads FF_RUMBLE effects (UI_FF_UPLOAD), then plays/stops
+    /// them via EV_FF events. We cache each effect's magnitudes and, on play,
+    /// return them scaled to the GIP 0..100 range (stop → zeros). Called every
+    /// EP1 loop iteration; the device fd is O_NONBLOCK so this never blocks.
+    pub fn poll_rumble(&mut self) -> Option<(u8, u8)> {
+        let events: Vec<_> = match self.gamepad.fetch_events() {
+            Ok(it) => it.collect(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(e) => {
+                log::debug!("ff fetch_events: {e}");
+                return None;
+            }
+        };
+
+        let mut out = None;
+        for ev in events {
+            match ev.kind() {
+                InputEventKind::UInput(UI_FF_UPLOAD) => {
+                    if let Ok(mut up) = self.gamepad.process_ff_upload(ev) {
+                        let mut id = up.effect_id();
+                        if id < 0 {
+                            id = self.next_effect_id;
+                            self.next_effect_id = self.next_effect_id.wrapping_add(1).max(0);
+                            up.set_effect_id(id);
+                        }
+                        if let FFEffectKind::Rumble {
+                            strong_magnitude,
+                            weak_magnitude,
+                        } = up.effect().kind
+                        {
+                            self.ff_effects.insert(id, (strong_magnitude, weak_magnitude));
+                        }
+                    }
+                }
+                InputEventKind::UInput(UI_FF_ERASE) => {
+                    if let Ok(er) = self.gamepad.process_ff_erase(ev) {
+                        self.ff_effects.remove(&(er.effect_id() as i16));
+                    }
+                }
+                InputEventKind::ForceFeedback(id) => {
+                    // value != 0 → play (repeat count); 0 → stop.
+                    out = Some(if ev.value() != 0 {
+                        self.ff_effects
+                            .get(&(id as i16))
+                            .map(|&(s, w)| (scale_mag(s), scale_mag(w)))
+                            .unwrap_or((0, 0))
+                    } else {
+                        (0, 0)
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Translate a GIP INPUT (0x20) report into gamepad ABS/BTN events, using
@@ -241,7 +312,28 @@ fn build_gamepad() -> Result<VirtualDevice> {
     ] {
         builder = builder.with_absolute_axis(&UinputAbsSetup::new(axis, info))?;
     }
-    builder.build().map_err(|e| anyhow!("build gamepad uinput: {e}"))
+
+    // Force feedback (rumble). The kernel will send us effect upload/play events.
+    let mut ff = AttributeSet::<FFEffectType>::new();
+    ff.insert(FFEffectType::FF_RUMBLE);
+    builder = builder.with_ff(&ff)?.with_ff_effects_max(16);
+
+    let dev = builder.build().map_err(|e| anyhow!("build gamepad uinput: {e}"))?;
+
+    // Make FF reads non-blocking so poll_rumble() can be called inline.
+    let fd = dev.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    Ok(dev)
+}
+
+/// Scale an FF magnitude (0..=0xffff) to the GIP rumble range (0..=100).
+fn scale_mag(m: u16) -> u8 {
+    ((m as u32 * 100) / 0xffff) as u8
 }
 
 fn build_keyboard() -> Result<VirtualDevice> {
