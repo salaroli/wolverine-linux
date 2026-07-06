@@ -472,25 +472,63 @@ sudo ./target/release/wolverined audio           # só o bridge PipeWire (sem US
 O Python em `tools/` continua válido como referência/legado; o Rust é o caminho
 do produto final.
 
+### Estado atual (handoff) e próximos passos
+
+**Feito e validado no hardware:** driver Rust feature-complete (gamepad com mapa
+xpad + Guide, áudio limpo, mic, botões de mídia, rumble) **+ daemon systemd**
+(`packaging/`: unit + regra udev + `install.sh`, ativado por udev, ciclo de vida
+limpo no plug/unplug/replug).
+
+**Estado do git:** `main` tem PR #1 (gip-init legado) e PR #2 (rewrite Rust)
+mergeados. **PR #3** (`feat/systemd-daemon`) aberta com o daemon, aguardando merge.
+
+**⏳ PRÓXIMO FOCO — latência de áudio (voz sai atrasada).** Ainda não investigado.
+Ordem sugerida (mais provável → menos):
+1. **Baixar o priming de OUT:** `OUT_PRIME_BYTES` em `iso.rs` (hoje `192*40` = ~40ms)
+   → ~10–15ms. É latência fixa embutida antes de drenar áudio real.
+2. **Menos runway em voo:** `OUT_NUM_XFERS`×`OUT_PKTS_PER_XFER` em `iso.rs`
+   (hoje 6×8 = ~48ms) → ex. 4×4. Corta latência ao custo de menos folga contra gaps.
+3. **Hint de latência no PipeWire:** passar `PW_KEY_NODE_LATENCY` (quantum menor)
+   nas properties do sink em `audio.rs`.
+4. **Instrumentar antes de chutar:** o log `[iso] … ring XB` já mostra a fila em
+   regime; medir quantos ms acumulam e ajustar por dado.
+
+⚠️ Trade-off **latência × underrun**: baixar demais o priming/runway pode trazer de
+volta a voz robótica (gaps no stream iso). É trabalho **iterativo com teste no
+hardware** — mexe num parâmetro, escuta, ajusta.
+
+**Para retomar:** após mergear a PR #3, `git checkout main && git pull`, criar
+`fix/audio-latency`, ajustar os parâmetros acima e testar (`sudo systemctl restart
+wolverined`, ou rodar o binário à mão com fones no jack e falar/tocar áudio).
+
 ---
 
 ## Estrutura do repositório
 
 ```
 wolverine-linux/
-├── CONTEXT.md              ← este arquivo
-├── README.md               ← status e documentação pública
-├── probe_results.log       ← resultado do probe sistemático de commands
+├── CONTEXT.md              ← este arquivo (base de conhecimento + handoff)
+├── README.md               ← status e documentação pública (centrada no Rust)
+├── rust/                   ← O DRIVER (produto final)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── gip.rs          ← wire format GIP (framing/varints/consts + testes)
+│       ├── usb.rs          ← handshake EP1 + event loop (nusb 0.1)
+│       ├── iso.rs          ← motor iso EP3 async (libusb1-sys FFI)
+│       ├── audio.rs        ← sink+source PipeWire nativo (pipewire-rs 0.10)
+│       ├── ring.rs         ← rings SPSC lock-free (rtrb)
+│       ├── input.rs        ← uinput gamepad + media keys + rumble (evdev 0.12)
+│       └── main.rs         ← orquestração + shutdown/lifecycle
+├── packaging/              ← daemon: unit systemd + regra udev + install.sh
 ├── docs/
 │   └── usb-analysis.md    ← análise completa dos descritores USB
-└── tools/
+└── tools/                  ← driver Python (REFERÊNCIA/LEGADO — RE do protocolo)
     ├── probe.py            ← monitor passivo inicial (histórico)
     ├── probe_gip.py        ← probe sistemático de command IDs
     ├── gip_init.py         ← driver userspace: GIP init + uinput + áudio + botões
     ├── iso_audio.py        ← motor iso assíncrono do EP3 via usb1 (OUT GIP-framed + IN)
     ├── wolverine_pw.c      ← shim PipeWire nativo (sink+source, rings)
-    ├── Makefile            ← gera wolverine_pw.so
-    └── wolverine_pw.so     ← binário compilado (gitignored)
+    └── Makefile            ← gera wolverine_pw.so (gitignored)
 ```
 
 Branch atual: `feat/gip-init`
