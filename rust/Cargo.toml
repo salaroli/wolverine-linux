@@ -1,0 +1,37 @@
+[package]
+name = "wolverine-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust userspace driver for the Razer Wolverine Ultimate: audio jack, mic and media buttons"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/salaroli/wolverine-linux"
+
+[[bin]]
+name = "wolverined"
+path = "src/main.rs"
+
+[dependencies]
+# USB — pure-Rust async transport; fits the isochronous EP3 engine well.
+# (rusb/libusb is the fallback option if nusb's iso support is insufficient.)
+nusb = "0.1"
+
+# PipeWire — official bindings. These replace the hand-written C shim
+# (tools/wolverine_pw.c) and expose SPA audio-format building natively.
+pipewire = "0.8"
+libspa = "0.8"
+
+# uinput — re-expose the gamepad and a separate keyboard-only device for media keys.
+input-linux = "0.7"
+
+# Lock-free SPSC ring buffer for the RT-audio <-> USB bridge (replaces the C
+# mutex + drop-on-overflow rings). One per direction.
+rtrb = "0.3"
+
+# Ergonomics
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# NOTE: crate versions are a starting point and may need bumping once the
+# toolchain is installed (`rustup` + `cargo build`). libspa/pipewire track
+# the installed PipeWire (1.6.6 here); adjust if the ABI mismatches.

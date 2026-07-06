@@ -4,3 +4,7 @@ __pycache__/
 *.log
 *.so
 *.o
+
+# Rust
+/rust/target/
+Cargo.lock
