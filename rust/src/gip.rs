@@ -9,6 +9,12 @@
 pub const VID: u16 = 0x1532;
 pub const PID: u16 = 0x0a14;
 
+/// Our GIP client id (matches the device). Combined with the option flags.
+pub const CLIENT_ID: u8 = 0x01;
+
+/// Common options byte for host-originated internal commands: CLIENT_ID | INTERNAL.
+pub const OPTS_INTERNAL: u8 = CLIENT_ID | opt::INTERNAL; // 0x21
+
 /// GIP command IDs relevant to this device. Status column refers to the
 /// Wolverine specifically (see CONTEXT.md table).
 pub mod cmd {
@@ -84,55 +90,95 @@ pub fn read_varint(buf: &[u8], pos: usize) -> Option<(u32, usize)> {
 
 /// Build a GIP header: `cmd, options, seq, <len varint>`.
 ///
-/// The header must be an even number of bytes (pad the last length byte if
-/// needed). This is the framing used for both directions of EP3 audio:
+/// The header must be an EVEN number of bytes. The padding is subtle and
+/// getting it wrong is the framing bug that produced robotic voice (CONTEXT.md):
+/// we do NOT append a raw 0x00 after the varint. Instead we extend the varint
+/// itself — set the continuation bit on its last byte and append a 0x00
+/// terminator — so e.g. len=192 becomes `c0 81 00` (which decodes back to 192),
+/// NOT `c0 01 00` (which decodes as 192 and then leaks the 0x00 into the payload).
+///
+/// This is the framing used for both directions of EP3 audio:
 ///   OUT (headphones): 0x60 0x21 <seq> <len=192> + 192B PCM
 ///   IN  (mic):        0x60 0x21 <seq> <len>     | <le16 length_out> | PCM
 pub fn build_header(cmd: u8, options: u8, seq: u8, payload_len: u32) -> Vec<u8> {
-    let mut hdr = Vec::with_capacity(6);
+    let mut len_varint = Vec::new();
+    write_varint(&mut len_varint, payload_len);
+    if (3 + len_varint.len()) % 2 != 0 {
+        let last = len_varint.len() - 1;
+        len_varint[last] |= 0x80; // continuation
+        len_varint.push(0x00); // terminator, keeps the decoded value unchanged
+    }
+    let mut hdr = Vec::with_capacity(3 + len_varint.len());
     hdr.push(cmd);
     hdr.push(options);
     hdr.push(seq);
-    write_varint(&mut hdr, payload_len);
-    if hdr.len() % 2 != 0 {
-        hdr.push(0x00); // keep header even-length
-    }
+    hdr.extend_from_slice(&len_varint);
     hdr
 }
 
-/// Parsed view of a received GIP packet.
+/// Build a complete (non-chunked) GIP packet: header + payload.
+pub fn build_packet(cmd: u8, options: u8, seq: u8, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = build_header(cmd, options, seq, payload.len() as u32);
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+/// Parsed view of a received GIP packet. Mirrors Python's `decode_gip_header`
+/// plus a slice over the payload bytes actually present in this USB frame.
 #[derive(Debug, Clone)]
 pub struct Packet<'a> {
     pub cmd: u8,
     pub options: u8,
     pub seq: u8,
+    /// Length of the header (offset where the payload starts).
+    pub hdr_len: usize,
+    /// Declared payload length from the varint.
+    pub pkt_len: usize,
+    /// Chunk offset — meaningful only when `opt::CHUNK` is set in `options`.
+    pub chunk_offset: usize,
+    /// Payload bytes present in *this* frame (may be shorter than `pkt_len` for
+    /// chunked transfers; the caller reassembles by `chunk_offset`).
     pub payload: &'a [u8],
 }
 
-/// Decode a GIP header and return the packet with a payload slice.
-///
-/// TODO: handle chunking — the Wolverine sends chunks WITHOUT the CHUNK_START
-/// flag, using chunk_offset=0 as the initial position (see CONTEXT.md). This
-/// stub does not yet reassemble multi-chunk payloads.
+impl Packet<'_> {
+    pub fn is_chunked(&self) -> bool {
+        self.options & opt::CHUNK != 0
+    }
+    pub fn wants_ack(&self) -> bool {
+        self.options & opt::ACK != 0
+    }
+}
+
+/// Decode a GIP header. Matches Python `decode_gip_header`: read the length
+/// varint (no even-length adjustment on receive — the even padding is only a
+/// send-side concern), then the chunk_offset varint iff the CHUNK flag is set.
 pub fn decode(buf: &[u8]) -> Option<Packet<'_>> {
-    if buf.len() < 3 {
+    if buf.len() < 4 {
         return None;
     }
     let cmd = buf[0];
     let options = buf[1];
     let seq = buf[2];
-    let (len, consumed) = read_varint(buf, 3)?;
-    let mut payload_start = 3 + consumed;
-    // header padded to even length
-    if payload_start % 2 != 0 {
-        payload_start += 1;
+    let (pkt_len, consumed) = read_varint(buf, 3)?;
+    let mut pos = 3 + consumed;
+
+    let mut chunk_offset = 0usize;
+    if options & opt::CHUNK != 0 {
+        let (off, c) = read_varint(buf, pos)?;
+        chunk_offset = off as usize;
+        pos += c;
     }
-    let end = (payload_start + len as usize).min(buf.len());
+
+    let end = (pos + pkt_len as usize).min(buf.len());
     Some(Packet {
         cmd,
         options,
         seq,
-        payload: buf.get(payload_start..end)?,
+        hdr_len: pos,
+        pkt_len: pkt_len as usize,
+        chunk_offset,
+        payload: buf.get(pos..end)?,
     })
 }
 
@@ -170,5 +216,34 @@ mod tests {
         let mut s = SeqCounter(254);
         assert_eq!(s.next(), 255);
         assert_eq!(s.next(), 1); // wraps past 0
+    }
+
+    #[test]
+    fn audio_out_header_framing() {
+        // The exact bytes that fixed the robotic voice: 60 21 <seq> c0 81 00.
+        let hdr = build_header(cmd::AUDIO_SAMPLES, OPTS_INTERNAL, 7, 192);
+        assert_eq!(hdr, vec![0x60, 0x21, 0x07, 0xc0, 0x81, 0x00]);
+        // ...and it must decode back to a 192-byte payload length with an
+        // even (6-byte) header, so no 0x00 leaks into the PCM.
+        let mut frame = hdr.clone();
+        frame.extend_from_slice(&[0xAB; 192]);
+        let pkt = decode(&frame).unwrap();
+        assert_eq!(pkt.cmd, cmd::AUDIO_SAMPLES);
+        assert_eq!(pkt.pkt_len, 192);
+        assert_eq!(pkt.hdr_len, 6);
+        assert_eq!(pkt.payload[0], 0xAB);
+    }
+
+    #[test]
+    fn header_even_length() {
+        // Headers are always even-length regardless of payload size.
+        for len in [0u32, 1, 63, 64, 127, 128, 192, 255, 4096] {
+            let hdr = build_header(cmd::AUDIO_SAMPLES, OPTS_INTERNAL, 1, len);
+            assert_eq!(hdr.len() % 2, 0, "len={len} header not even");
+            let mut frame = hdr.clone();
+            frame.extend(std::iter::repeat(0u8).take(len as usize));
+            let pkt = decode(&frame).unwrap();
+            assert_eq!(pkt.pkt_len, len as usize, "roundtrip len={len}");
+        }
     }
 }

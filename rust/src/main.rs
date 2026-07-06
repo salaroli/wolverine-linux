@@ -16,6 +16,10 @@
 //! ../CONTEXT.md for the full knowledge base. Wire the TODOs bottom-up:
 //! gip (done) -> usb -> iso -> audio -> input -> main.
 
+// Temporary while the port is in progress: several modules are stubs whose
+// items are wired up in later steps. Remove once all modules are implemented.
+#![allow(dead_code)]
+
 mod audio;
 mod gip;
 mod input;
@@ -26,25 +30,28 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     env_logger::init();
-    log::info!("wolverined starting (skeleton)");
+    log::info!("wolverined starting");
 
     // 1. USB device + control interfaces, detach xpad.
     let mut dev = usb::Device::open()?;
 
-    // 2. Virtual input devices.
-    let _uinput = input::Uinput::create()?;
-
     // 3. Audio bring-up on EP1 (IDENTIFY / AUDIO_FORMAT / POWER ON).
+    //    This is the crown-jewel path: if POWER ON lands, the DAC/ADC wake up.
     dev.bring_up_audio()?;
 
-    // 4. PipeWire sink + source in the invoking user's session.
-    let _bridge = audio::Bridge::start()?;
+    // --- Everything below is not implemented yet (stubs). Until iso.rs /
+    //     audio.rs / input.rs land, `wolverined` runs the handshake and exits,
+    //     which is a valid smoke-test of the bring-up sequence on real hardware.
+    log::info!("handshake complete — remaining stages (audio/iso/input) not implemented yet");
 
-    // 5. Async isochronous EP3 engine (claims interface 1 AFTER the EP1 handshake).
-    let _iso = iso::IsoAudio::start()?;
-
-    // 6. Blocking event loop: gamepad + media buttons on EP1, control on EP2.
-    dev.run_event_loop()?;
+    // 2. Virtual input devices.                    (input.rs — pending)
+    // let _uinput = input::Uinput::create()?;
+    // 4. PipeWire sink + source (user session).     (audio.rs — pending, blocked on pipewire-rs)
+    // let _bridge = audio::Bridge::start()?;
+    // 5. Async isochronous EP3 engine.              (iso.rs — pending)
+    // let _iso = iso::IsoAudio::start()?;
+    // 6. Blocking event loop: gamepad + media.      (usb.rs::run_event_loop — pending)
+    // dev.run_event_loop()?;
 
     Ok(())
 }
