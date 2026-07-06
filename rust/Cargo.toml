@@ -22,12 +22,10 @@ async-io = "2"
 
 # PipeWire — official bindings. These replace the hand-written C shim
 # (tools/wolverine_pw.c) and expose SPA audio-format building natively.
-# TEMPORARILY DISABLED: pipewire-rs 0.8 (libspa) fails to build against the
-# system PipeWire 1.6.6 (spa_pod_builder layout changed). Re-enable once the
-# compat issue is resolved — see the audio.rs task. Until then audio.rs is a
-# stub that doesn't reference these types.
-# pipewire = "0.8"
-# libspa = "0.8"
+# 0.8 failed to build against the system PipeWire 1.6.6 (spa_pod_builder layout
+# changed); trying 0.10 which is newer.
+pipewire = "0.10"
+libspa = "0.10"
 
 # uinput — re-expose the gamepad and a separate keyboard-only device for media keys.
 input-linux = "0.7"

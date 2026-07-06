@@ -24,12 +24,21 @@ mod audio;
 mod gip;
 mod input;
 mod iso;
+mod ring;
 mod usb;
 
 use anyhow::Result;
 
 fn main() -> Result<()> {
     env_logger::init();
+
+    // `wolverined audio` — audio-only smoke test: bring up the PipeWire nodes
+    // without touching USB (no root / no xpad detach needed). Verify with
+    // `wpctl status`, `pw-play --target wolverine_headphones <file>`, etc.
+    if std::env::args().nth(1).as_deref() == Some("audio") {
+        return audio_smoke();
+    }
+
     log::info!("wolverined starting");
 
     // 1. USB device + control interfaces, detach xpad.
@@ -54,4 +63,23 @@ fn main() -> Result<()> {
     // dev.run_event_loop()?;
 
     Ok(())
+}
+
+/// Audio-only smoke test (no USB): start the PipeWire bridge and park.
+fn audio_smoke() -> Result<()> {
+    log::info!("audio-only smoke test");
+    let (_bridge, _rings) = audio::Bridge::start(
+        audio::OUT_RATE,
+        audio::OUT_CHANNELS,
+        audio::IN_RATE,
+        audio::IN_CHANNELS,
+    )?;
+    log::info!(
+        "nodes up: 'Wolverine Headphones' + 'Wolverine Microphone'. \
+         Check `wpctl status`. Nothing drains the sink yet (no controller), \
+         so playback just fills the ring and the mic outputs silence. Ctrl+C to exit."
+    );
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
