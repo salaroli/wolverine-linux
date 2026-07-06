@@ -12,6 +12,7 @@ Run as root.
 
 import os
 import sys
+import ctypes
 import shutil
 import subprocess
 import time
@@ -1312,85 +1313,171 @@ def monitor_ctrl(dev, stop: threading.Event) -> None:
             time.sleep(0.1)
 
 
-def _gen_tone(freq: int = 440, sample_rate: int = 48000,
-              channels: int = 2, duration_ms: int = 1) -> bytes:
-    import math
-    n_samples = sample_rate * duration_ms // 1000
-    out = []
-    for i in range(n_samples):
-        val = int(32767 * 0.3 * math.sin(2 * math.pi * freq * i / sample_rate))
-        out.append(struct.pack("<h", val) * channels)
-    return b"".join(out)
+# ---------------------------------------------------------------------------
+# PipeWire bridge (native, via tools/wolverine_pw.so)
+# ---------------------------------------------------------------------------
+
+# Output (headphones): 48 kHz stereo, 192 PCM bytes per EP3 OUT packet (48 frames).
+OUT_RATE       = 48000
+OUT_CHANNELS   = 2
+EP3_OUT_PCM    = 192
+
+# Input (mic): the controller streams ~48000 bytes/s, i.e. 24 kHz mono (not the
+# 48 kHz stereo of the output). PipeWire resamples to whatever consumers want.
+# Confirm with the "[audio-in] … bytes/s" diagnostic while speaking.
+IN_RATE        = 24000
+IN_CHANNELS    = 1
+IN_STRIDE      = IN_CHANNELS * 2
 
 
-def stream_audio_out(dev, stop: threading.Event) -> None:
-    tone    = struct.pack("<H", 192) + _gen_tone(440, 48000, 2, 1)[:192]
-    silence = struct.pack("<H", 192) + bytes(192)
+def load_pipewire_bridge():
+    """Load the compiled native bridge. Returns the ctypes lib, or None if the
+    .so is missing (run `make -C tools`)."""
+    # The bridge connects to PipeWire from this (root, under sudo) process.
+    # Point libpipewire at the invoking user's session so the virtual nodes land
+    # in the user's audio graph — not root's (which usually has none). Root can
+    # open the user's socket, so this just works.
+    uid = os.environ.get("SUDO_UID")
+    if os.geteuid() == 0 and uid:
+        os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
 
-    tone_duration = 5.0
-    start    = time.time()
-    sent     = 0
-    errors   = 0
-    last_log = time.time()
-    print(f"[audio-out] Playing 440Hz tone for {tone_duration:.0f}s on EP3 OUT…")
+    here = os.path.dirname(os.path.abspath(__file__))
+    so   = os.path.join(here, "wolverine_pw.so")
+    if not os.path.exists(so):
+        print(f"[pw] {so} not found — build it with `make -C tools`. "
+              "Audio devices disabled (raw passthrough only).")
+        return None
+    lib = ctypes.CDLL(so)
+    lib.wpw_start.argtypes          = [ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int]
+    lib.wpw_start.restype           = ctypes.c_int
+    lib.wpw_stop.argtypes           = []
+    lib.wpw_stop.restype            = None
+    lib.wpw_playback_avail.argtypes = []
+    lib.wpw_playback_avail.restype  = ctypes.c_int
+    lib.wpw_read_playback.argtypes  = [ctypes.c_void_p, ctypes.c_int]
+    lib.wpw_read_playback.restype   = ctypes.c_int
+    lib.wpw_write_capture.argtypes  = [ctypes.c_char_p, ctypes.c_int]
+    lib.wpw_write_capture.restype   = ctypes.c_int
+    return lib
+
+
+# Buffer this much before we start draining, so jitter/burstiness never empties
+# the ring (~20 ms cushion at 192 B/ms). Larger = smoother but more latency.
+PLAY_PRIME_BYTES = EP3_OUT_PCM * 20
+
+
+def stream_audio_out(dev, stop: threading.Event, pw) -> None:
+    """Drain the PipeWire sink ring to EP3 OUT. The device plays raw 192-byte S16
+    stereo PCM (48 frames); the earlier <u16 len> prefix was actually played as a
+    sample, causing a left-channel buzz and a half-frame misalignment (crackle) —
+    so we send raw PCM by default (WOLV_OUT_HEADER=1 restores the old prefix).
+
+    Once primed, a transient dip sends a single silence packet (1 ms) but keeps
+    the stream primed, so we never punch an 8 ms re-prime gap (robotic artifact)."""
+    prefix  = struct.pack("<H", EP3_OUT_PCM) if os.environ.get("WOLV_OUT_HEADER") else b""
+    silence = prefix + bytes(EP3_OUT_PCM)
+    rbuf    = ctypes.create_string_buffer(EP3_OUT_PCM)
+    errors  = 0
+    primed  = False
+    pending = None
+    is_sil  = True
+    # diagnostics
+    sent = under = 0
+    avail_min = avail_max = 0
+    last_dbg = time.time()
+    print(f"[audio-out] EP3 OUT header={'u16 len' if prefix else 'NONE (raw PCM)'} "
+          f"← PipeWire sink 'Wolverine Headphones'"
+          if pw else "[audio-out] EP3 OUT (silence — no PipeWire bridge)")
 
     while not stop.is_set():
-        now          = time.time()
-        playing_tone = (now - start) < tone_duration
-        packet       = tone if playing_tone else silence
+        if pending is None:
+            if pw is None:
+                pending = silence
+                is_sil  = True
+            else:
+                avail = pw.wpw_playback_avail()
+                avail_min = min(avail_min, avail)
+                avail_max = max(avail_max, avail)
+                if not primed:
+                    primed  = avail >= PLAY_PRIME_BYTES
+                    pending = silence
+                    is_sil  = True
+                elif avail >= EP3_OUT_PCM:
+                    pw.wpw_read_playback(rbuf, EP3_OUT_PCM)
+                    pending = prefix + rbuf.raw[:EP3_OUT_PCM]
+                    is_sil  = False
+                else:
+                    pending = silence          # transient underrun: 1 ms gap only
+                    is_sil  = True
         try:
-            dev.write(EP_AUDIO_OUT, packet, timeout=5)
-            sent  += 1
-            errors = 0
+            dev.write(EP_AUDIO_OUT, pending, timeout=5)
+            sent += 1
+            if is_sil and primed:
+                under += 1
+            pending = None
+            errors  = 0
         except usb.core.USBTimeoutError:
-            pass
+            pass                                # keep pending, retry same packet
         except usb.core.USBError as e:
             errors += 1
+            pending = None
             if errors == 1:
                 print(f"[audio-out] write error: {e}")
             if errors > 100:
                 print("[audio-out] too many errors, stopping")
                 break
 
-        if not playing_tone and sent == 1:
-            print("[audio-out] Tone done — switching to silence")
+        now = time.time()
+        if now - last_dbg >= 5.0:
+            dt = now - last_dbg
+            print(f"[audio-out] {sent/dt:.0f} pkt/s, {under} underruns/5s, "
+                  f"ring {avail_min}-{avail_max}B")
+            sent = under = 0
+            avail_min = avail_max = pw.wpw_playback_avail() if pw else 0
+            last_dbg = now
 
-        if now - last_log >= 5.0:
-            label = "tone" if playing_tone else "silence"
-            print(f"[audio-out] {sent} packets/5s ({sent/5:.0f}/s) — {label}")
-            sent     = 0
-            last_log = now
 
-
-def monitor_audio(dev, stop: threading.Event) -> None:
-    print("[audio-in]  Monitoring EP3 IN (isochronous mic)...")
-    count    = 0
+def monitor_audio(dev, stop: threading.Event, pw) -> None:
+    """Read EP3 IN (GIP AUDIO_SAMPLES), extract PCM and feed the PipeWire source.
+    Packet layout: GIP header, 2-byte sub-header, then S16LE PCM."""
+    print("[audio-in]  EP3 IN → PipeWire source 'Wolverine Microphone'"
+          if pw else "[audio-in]  Monitoring EP3 IN (no PipeWire bridge)")
     reads    = 0
+    pcm_bytes = 0
+    last_sz  = 0
     last_dbg = time.time()
     while not stop.is_set():
         try:
-            raw  = dev.read(EP_AUDIO_IN, 228, timeout=100)
-            data = bytes(raw)
+            data = bytes(dev.read(EP_AUDIO_IN, 228, timeout=100))
             reads += 1
-            if data and any(data):
-                count += 1
-                if count <= 3:
-                    ts = time.strftime("%H:%M:%S")
-                    print(f"\n[audio-in {ts}] EP3 IN {len(data)} bytes non-zero (#{count}):")
-                    hexdump(data)
-                elif count == 4:
-                    print("[audio-in] ✓ Stream active — mic audio is flowing!")
         except usb.core.USBTimeoutError:
-            pass
+            continue
         except usb.core.USBError as e:
             if not stop.is_set():
                 print(f"[audio-in] error: {e}")
             time.sleep(0.1)
+            continue
+
+        if len(data) >= 4 and data[0] == GIP_CMD_AUDIO_SAMPLES:
+            hdr = decode_gip_header(data)
+            if hdr:
+                _, _, _, hdr_len, pkt_len, _ = hdr
+                payload = data[hdr_len:hdr_len + pkt_len]
+                pcm = payload[2:]                 # skip 2-byte sub-header
+                if pcm:
+                    last_sz = len(pcm)
+                    pcm_bytes += len(pcm)
+                    if pw is not None:
+                        pw.wpw_write_capture(pcm, len(pcm))
 
         now = time.time()
         if now - last_dbg >= 5.0:
-            print(f"[audio-in] {reads} reads in 5s — {count} non-silent total")
-            reads    = 0
+            rate = pcm_bytes / (now - last_dbg)
+            # bytes/s ÷ 2 (S16) = samples/s; ÷ channels = frame rate
+            print(f"[audio-in] {reads} reads/5s — {rate:.0f} PCM bytes/s "
+                  f"(~{rate/2:.0f} S16 samples/s), last pkt {last_sz}B")
+            reads = pcm_bytes = 0
             last_dbg = now
 
 
@@ -1455,9 +1542,21 @@ def main():
 
     stop = threading.Event()
 
+    print("\nStarting PipeWire bridge...")
+    pw = load_pipewire_bridge()
+    if pw is not None:
+        rc = pw.wpw_start(OUT_RATE, OUT_CHANNELS, IN_RATE, IN_CHANNELS)
+        if rc == 0:
+            print(f"  ✓ PipeWire devices: 'Wolverine Headphones' "
+                  f"({OUT_RATE//1000}kHz/{OUT_CHANNELS}ch sink) + "
+                  f"'Wolverine Microphone' ({IN_RATE//1000}kHz/{IN_CHANNELS}ch source)")
+        else:
+            print(f"  WARNING: wpw_start failed (rc={rc}) — audio devices disabled")
+            pw = None
+
     print("Starting EP3 audio streams...")
-    t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop), daemon=True)
-    t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop), daemon=True)
+    t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop, pw), daemon=True)
+    t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop, pw), daemon=True)
     t_audio_out.start()
     t_audio_in.start()
 
@@ -1480,8 +1579,11 @@ def main():
         stop.set()
         print("\nStopping...")
 
-    for t in threads:
+    for t in [*threads, t_audio_out, t_audio_in]:
         t.join(timeout=1)
+
+    if pw is not None:
+        pw.wpw_stop()
 
     for iface in [0, 1, 2]:
         try:
