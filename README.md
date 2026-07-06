@@ -44,6 +44,7 @@ wolverine-linux/
 │   ├── probe.py         # USB interface monitor (early passive discovery)
 │   ├── probe_gip.py     # systematic GIP command-ID probe
 │   ├── gip_init.py      # userspace driver: GIP init + uinput gamepad + audio + media
+│   ├── iso_audio.py     # async isochronous EP3 engine (usb1): GIP-framed OUT + mic IN
 │   ├── wolverine_pw.c   # native PipeWire bridge (compiled to wolverine_pw.so)
 │   └── Makefile         # builds wolverine_pw.so
 ├── docs/
@@ -54,7 +55,7 @@ wolverine-linux/
 ## Requirements
 
 - Linux kernel ≥ 6.x
-- Python ≥ 3.10, `python-pyusb`, `python-evdev`
+- Python ≥ 3.10, `python-pyusb`, `python-evdev`, `python-libusb1` (async EP3 audio)
 - PipeWire + `wpctl` (for audio and media-button volume/mute)
 - A C toolchain and the PipeWire development headers, to build the audio bridge:
   - **Arch / CachyOS:** `base-devel` + `pipewire` (headers included)

@@ -13,11 +13,11 @@ O gamepad em si já funciona nativamente via driver `xpad` do kernel.
 | Frente | Status |
 |---|---|
 | Gamepad | ✅ funciona (xpad + re-exposto via uinput) |
-| Áudio saída (fones) | 🟡 funciona via PipeWire (sink *Wolverine Headphones*), mas com **voz robótica** (ver Próximos passos) |
-| Áudio entrada (mic) | 🟡 funciona via PipeWire (source *Wolverine Microphone*), formato **24kHz mono** confirmado |
+| Áudio saída (fones) | ✅ **voz limpa** via PipeWire (sink *Wolverine Headphones*) — iso assíncrono + enquadramento GIP |
+| Áudio entrada (mic) | ✅ funciona via PipeWire (source *Wolverine Microphone*), formato **24kHz mono** confirmado |
 | Botões de mídia | ✅ volume + mic mute espelhados no PipeWire |
-| **Voz robótica** (saída) | ❌ **PENDENTE** — iso síncrono tem micro-gaps; fix = iso assíncrono (ver Próximos passos) |
-| **Buzz canal esquerdo** | ❌ **PENDENTE** — é hardware/analógico; só mitigável (ver Próximos passos) |
+| ~~Voz robótica~~ (saída) | ✅ **RESOLVIDO** — a causa era **formato** (faltava header GIP no OUT), não timing (ver seção dedicada) |
+| ~~Buzz canal esquerdo~~ | ✅ **RESOLVIDO** — sumiu junto com o fix do enquadramento GIP; **não era hardware** (ver seção dedicada) |
 
 > **Marco (breakthrough):** o áudio do jack **funciona no Linux**. A conclusão
 > anterior de "limitação de hardware irreversível" estava **errada**. O elo perdido
@@ -152,9 +152,9 @@ capturado. É a próxima frente.
 1. ✅ **Áudio (protocolo)** — jack e mic funcionam via POWER ON. *Feito.*
 2. ✅ **Botões de mídia** — volume e mic mute espelhados no PipeWire. *Feito.*
 3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito, com 2 bugs abertos.*
-4. ❌ **Corrigir voz robótica** (iso assíncrono) — **PRÓXIMO FOCO**. Ver seção dedicada.
-5. ❌ **Buzz canal esquerdo** (hardware) — mitigação opcional. Ver seção dedicada.
-6. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot.
+4. ✅ **Voz robótica corrigida** — iso assíncrono (usb1) **+ enquadramento GIP no OUT**. *Feito.* Ver seção dedicada.
+5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
+6. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot. **PRÓXIMO FOCO.**
 
 ## Botões de mídia — RESOLVIDO
 
@@ -213,17 +213,20 @@ nativas não existem (o `pipewire_python` é wrapper de CLI, e `spa_format_audio
   `wpw_playback_avail()`, `wpw_read_playback(dst,len)`, `wpw_write_capture(src,len)`.
 - Sink e source têm **formatos independentes** (o mic não é igual à saída).
 
-### Aprendizado crítico: framing do EP3 (as duas direções são DIFERENTES)
+### Aprendizado crítico: framing do EP3 (as duas direções são GIP, quase simétricas)
 
-- **EP3 OUT (fones):** **PCM cru**, 192 bytes por pacote (48 frames S16LE **48kHz stereo**),
-  ~1000 pacotes/s. **NÃO tem header.** O código antigo mandava um prefixo `<u16 192>`
-  (= bytes `c0 00`) achando que era "length" — mas o device **tocava esses 2 bytes como
-  PCM**, causando (a) buzz no canal esquerdo e (b) 194 bytes = 48,5 frames → desalinhamento
-  = crackle. Remover o prefixo (PCM cru) **matou o crackle**. Flag `WOLV_OUT_HEADER=1`
-  restaura o prefixo antigo só p/ teste.
-- **EP3 IN (mic):** **GIP-framed** `60 21 <seq> <len> | <2B sub-header> | <PCM>`. O PCM é
-  **24kHz mono** (confirmado: ~48000 bytes/s ÷ 2 = 24000 amostras/s). Parseado com
-  `decode_gip_header()`, pulando o sub-header de 2 bytes.
+- **EP3 OUT (fones):** **GIP-framed** `60 21 <seq> <len=192>` + **192B de PCM** (48 frames
+  S16LE **48kHz stereo**), ~1000 pacotes/s → **198B por pacote iso**. A `seq` incrementa
+  1..255 (nunca 0), uma por pacote. **NÃO é PCM cru** — mandar PCM cru = voz robótica
+  (o firmware desincroniza sem o header). Espelha `gip_copy_audio_samples()` do xone.
+  *Histórico:* o antigo prefixo `<u16 192>` (= `c0 00`) era um header errado (faltava
+  `60 21 <seq>`); tocava como PCM → buzz/crackle. "PCM cru" só soava menos pior. O header
+  GIP completo `60 21 <seq> c0 81 00` foi o que resolveu.
+- **EP3 IN (mic):** **GIP-framed** `60 21 <seq> <len> | <2B length_out le16> | <PCM>`. O
+  sub-header de 2 bytes é o `__le16 length_out` do `struct gip_pkt_audio_samples` do xone.
+  PCM é **24kHz mono** (confirmado: ~48000 bytes/s ÷ 2 = 24000 amostras/s). Parseado com
+  `decode_gip_header()`, pulando os 2 bytes. **Diferença OUT↔IN:** o IN tem o `length_out`
+  le16 depois do header GIP; o OUT não (header GIP + PCM direto).
 
 ### Como rodar
 
@@ -237,57 +240,87 @@ via `SUDO_UID`), senão os nós iriam pro root.
 
 ---
 
-## ❌ PRÓXIMO PASSO 1 — Corrigir a voz robótica (saída)
+## ✅ RESOLVIDO — Voz robótica (saída)
 
-### Diagnóstico (fechado, com dados)
+A voz saiu **limpa** com duas mudanças combinadas. A segunda foi a que realmente resolveu;
+a primeira eliminou uma variável e produziu a evidência que apontou pra causa certa.
 
-Instrumentei o `stream_audio_out`. Com áudio tocando:
+### O erro de diagnóstico (documentado pra não repetir)
+
+O diagnóstico anterior fechou na conclusão **errada**: "iso síncrono → micro-gaps →
+voz robótica". Baseava-se em: `stream_audio_out` mostrava `1000 pkt/s, 0 underruns, ring
+estável`, "nosso lado impecável", logo o problema *só poderia* estar no transporte USB.
+
+A correção do transporte (iso assíncrono, abaixo) foi implementada — e o novo motor
+reportou janelas de **`OUT 1000 pkt/s (0 silent/5s)`**: 5 segundos inteiros com PCM real
+em *todo* frame de 1ms, zero gaps, zero silêncio. **E continuou robótica.** Isso **refutou**
+a teoria do timing: se fossem gaps, essas janelas teriam saído limpas. O artefato robótico
+era **formato dos dados**, não pacing.
+
+**Lição:** "pacing perfeito e ainda quebrado" ≠ "a próxima camada é o transporte". Quando o
+timing está comprovadamente limpo e o áudio ainda é lixo, o problema é o **conteúdo/formato**
+do que se manda, não *quando*. Foi o mesmo tipo de erro do capítulo "áudio impossível":
+concluir causa raiz a partir de evidência ambígua sem comparar com o driver de referência.
+
+### Causa raiz real: faltava o header GIP em cada pacote OUT
+
+Comparando com o `gip_copy_audio_samples()` do **xone**, cada pacote de áudio OUT **não é
+PCM cru** — é um frame **GIP `AUDIO_SAMPLES`**:
+
 ```
-1000 pkt/s, 0 underruns/5s, ring 4480-5568B (~28ms, estável)
+[0x60] [0x21 = client_id|INTERNAL] [seq: incrementa 1..255, nunca 0] [len varint = 192]  |  192B PCM
 ```
-**O nosso lado está impecável:** pacing 1000/s certo, zero underrun, ring saudável.
-Mesmo assim a voz é robótica. Isso **elimina** buffer/PipeWire/ring e aponta pra **única
-camada restante: o transporte isócrono USB**.
 
-**Causa raiz:** usamos `dev.write` **síncrono, 1 pacote por vez**. Entre uma transferência
-terminar e a próxima ser submetida há um **micro-gap** (overhead do loop Python + GIL).
-Endpoint isócrono é implacável: frame de 1ms sem pacote = buraco. Espalhado numa voz =
-timbre robótico. (Já testamos: PCM cru vs prefixo, colchão 8ms vs 20ms, re-prime on/off —
-nada disso resolve, porque o problema está **abaixo** do nosso buffer.)
+É o **mesmo enquadramento que o mic usa na entrada** (`60 21 <seq> <len> | … | PCM`), que a
+gente já decodificava — só não tínhamos percebido a simetria. Mandando PCM cru, o firmware
+tentava interpretar bytes de PCM como header/sequência, dessincronizava e **sintetizava lixo
+(voz robótica) constante, independente do pacing**.
 
-### A correção (decidida): iso ASSÍNCRONO com fila de transferências
+Detalhe histórico que confirma: o antigo prefixo `<u16 192>` (= `c0 00`) nunca foi o header
+certo — faltava `60 21 <seq>`. Por isso "PCM cru" soou *menos pior* que o prefixo, mas nenhum
+dos dois era correto. O header GIP completo `60 21 <seq> c0 81 00` nunca tinha sido testado.
 
-Manter **N buffers (8–16) sempre em voo**, resubmetidos em callback, pro controlador de USB
-nunca ficar sem pacote no próximo frame.
+### As duas mudanças (em `tools/iso_audio.py` + `gip_init.py`)
 
-**Abordagem escolhida: opção #1 — `python-libusb1` (`usb1`) só para o EP3.**
-- Mantém o `pyusb` pro resto (EP1 GIP, EP2). Segundo handle reivindicando **só a interface 1**.
-- Fica tudo em Python; o shim C continua só PipeWire.
-- Reescrever `stream_audio_out` e `monitor_audio` p/ transferências iso assíncronas em fila,
-  alimentando os **mesmos rings do C** (`wpw_read_playback`/`wpw_write_capture`).
-- Rodar uma thread de event loop do libusb (`usb1` `handleEvents`).
-- Cuidado: coordenar com o pyusb — hoje o `main` reivindica a interface 1; passar essa posse
-  pro `usb1`. A negociação GIP (POWER/FORMAT) no EP1 acontece ANTES, então a ordem importa.
+1. **Enquadramento GIP no OUT** (a correção): cada pacote iso OUT = header GIP de 6 bytes
+   (`build_gip_header(0x60, 0x21, seq, 192)`) + 192B de PCM = **198B/pacote**, com **sequência
+   incremental por pacote**. Espelha o xone byte a byte.
+2. **Iso assíncrono via `python-libusb1` (`usb1`)** (higiene de transporte + a evidência):
+   N transfers sempre em voo (OUT 6×8pkt ≈ 48ms, IN 4×8pkt), resubmetidos em callback,
+   alimentando os **mesmos rings do shim C** (`wpw_read_playback`/`wpw_write_capture`).
+   `usb1` reivindica **só a interface 1**; o `pyusb` mantém EP1 (GIP) e EP2 (bulk) — duas
+   handles libusb no mesmo device, cada uma com interfaces diferentes. A negociação GIP
+   (POWER/FORMAT) no EP1 acontece ANTES do `usb1` pegar a interface 1 — a ordem importa.
+   Priming de ~40ms no ring antes de drenar áudio real, pra bursts do PipeWire não esvaziarem
+   o ring no meio do stream.
 
-Alternativa registrada (não escolhida): mover o EP3 pro C com libusb async (mais coeso com
-os rings, mas adiciona libusb ao build C e coordenação de handle).
+Se o `usb1` não estiver disponível ou a interface 1 der `BUSY`, o `main` cai no caminho
+síncrono antigo (`stream_audio_out`/`monitor_audio`) — que agora **também** enquadra o OUT
+como GIP, então a diferença passa a ser só o pacing.
 
 ---
 
-## ❌ PRÓXIMO PASSO 2 — Buzz no canal esquerdo (hardware)
+## ✅ RESOLVIDO — Buzz no canal esquerdo (era o mesmo bug de formato)
 
-**Veredito: é analógico/hardware, não está no nosso sinal.** Provas:
-- Com PCM **cru de zeros** (silêncio digital perfeito), o buzz **continua**.
-- **Escala com o botão físico** de volume (ganho analógico), não com volume digital.
-- Só no canal **esquerdo** → desbalanço/ruído no amp do controle (provável aterramento do
-  jack combo ou ruído da alimentação USB acoplado no analógico).
+**Sumiu junto com o fix do enquadramento GIP no OUT.** A conclusão anterior — "é
+analógico/hardware, não está no nosso sinal" — estava **errada**, pelo mesmo motivo da voz
+robótica: era outro sintoma de mandar PCM cru onde o firmware espera frames GIP. Os bytes
+mal-enquadrados (o antigo prefixo `c0 00` e o desalinhamento de meio-frame) vazavam como
+amostras no canal esquerdo. Com cada pacote OUT enquadrado como `60 21 <seq> <len>` + PCM
+alinhado, o buzz **desapareceu**.
 
-**Não dá pra consertar no PCM.** Única alavanca de software:
-- **Parar o stream isócrono quando o áudio está idle** (nenhum app tocando no sink) → o
-  DAC/amp quiesce e o buzz some quando nada toca; volta ao tocar (com possível "pop" e uns
-  ms de latência no início). Precisa detectar o estado idle do sink (via PipeWire no shim C,
-  ex: contar consumidores/atividade) e pausar/retomar o envio no EP3 OUT.
-- Decisão pendente do usuário: se vale implementar isso ou tocar o barco (é hardware).
+### Por que as "provas de hardware" enganaram
+
+| Prova de então | Interpretação correta |
+|---|---|
+| Com "zeros crus" o buzz continua | Não eram zeros *enquadrados*: sem o header GIP, o device interpretava lixo/desalinhamento como PCM → ruído mesmo com payload zerado |
+| Escala com o botão físico de volume | O ruído já estava no sinal digital malformado; o amp analógico só o amplifica junto com o resto |
+| Só no canal esquerdo | O desalinhamento de meio-frame (194B = 48,5 frames) trocava a paridade L/R → o erro caía sistematicamente num canal |
+
+**Lição (a mesma da voz robótica):** antes de declarar "é hardware", garantir que o sinal
+digital que a gente manda está no formato **exato** do driver de referência. Duas "limitações
+de hardware irreversíveis" deste projeto (áudio impossível, depois o buzz) eram, na verdade,
+o host mandando a coisa errada.
 
 ---
 
@@ -296,9 +329,12 @@ os rings, mas adiciona libusb ao build C e coordenação de handle).
 - **`tools/wolverine_pw.c`** — shim PipeWire nativo (sink+source, rings). Compila limpo com
   PipeWire 1.6.6.
 - **`tools/Makefile`** — `make -C tools` gera `wolverine_pw.so` (gitignored).
-- **`tools/gip_init.py`** — integrado: `load_pipewire_bridge()` (ctypes), `stream_audio_out`
-  (drena sink→EP3 OUT, PCM cru, priming, diagnóstico pkt/s+underrun), `monitor_audio`
-  (EP3 IN→source, parse GIP, diagnóstico bytes/s), `forward_media` (botões).
+- **`tools/iso_audio.py`** — motor iso assíncrono do EP3 via `usb1` (classe `IsoAudio`):
+  N transfers OUT/IN sempre em voo, callbacks realimentando os rings do shim C. OUT
+  **GIP-framed** (header injetado do gip_init) + priming; IN parseia GIP e empurra pro source.
+- **`tools/gip_init.py`** — integração: `load_pipewire_bridge()` (ctypes), instancia
+  `IsoAudio` (caminho preferido); `stream_audio_out`/`monitor_audio` são o **fallback
+  síncrono** (também GIP-framed) se o `usb1`/interface 1 falhar; `forward_media` (botões).
 - Constantes de formato: `OUT_RATE=48000/OUT_CHANNELS=2`, `IN_RATE=24000/IN_CHANNELS=1`.
 
 ---
@@ -315,10 +351,11 @@ Driver userspace completo. Faz:
 5. Tenta GIP auth (falha graciosamente — device não suporta, e não é necessário p/ jack)
 6. Negocia AUDIO_FORMAT 48kHz stereo
 7. **Envia POWER ON (`pkt_power`, cmd 0x05) — acorda o áudio.** VOLUME fica sob flag `SEND_HW_VOLUME`
-8. Ativa alt=1 nas interfaces 1 e 2
+8. Reivindica interfaces [0,2] no pyusb (a 1 fica livre p/ o `usb1`); ativa alt=1 na interface 2
 9. **Inicia o bridge PipeWire** (`load_pipewire_bridge` + `wpw_start`) → sink + source
-10. Monitora EP1 IN (GIP/gamepad), EP2 IN (ctrl/bulk); `stream_audio_out` drena sink→EP3 OUT
-    e `monitor_audio` empurra EP3 IN→source (⚠️ iso síncrono = voz robótica, ver Passo 1)
+10. **Sobe o motor iso assíncrono** (`IsoAudio`, `usb1` reivindica a interface 1 + alt=1):
+    OUT GIP-framed sink→EP3 OUT, IN EP3→source. Fallback síncrono se `usb1`/iface 1 falhar.
+    Monitora EP1 IN (GIP/gamepad) e EP2 IN (ctrl/bulk) no pyusb.
 11. **Botões de mídia:** `forward_media()` espelha volume/mic mute no PipeWire (via `wpctl`)
     a partir dos reports `AUDIO_CONTROL` sub 0x00
 
@@ -348,6 +385,7 @@ wolverine-linux/
     ├── probe.py            ← monitor passivo inicial (histórico)
     ├── probe_gip.py        ← probe sistemático de command IDs
     ├── gip_init.py         ← driver userspace: GIP init + uinput + áudio + botões
+    ├── iso_audio.py        ← motor iso assíncrono do EP3 via usb1 (OUT GIP-framed + IN)
     ├── wolverine_pw.c      ← shim PipeWire nativo (sink+source, rings)
     ├── Makefile            ← gera wolverine_pw.so
     └── wolverine_pw.so     ← binário compilado (gitignored)
@@ -365,7 +403,7 @@ python-evdev         # instalado
 python-cryptography  # instalado (foi necessário para implementar auth)
 pipewire + headers   # instalado (Arch: no pacote `pipewire`); p/ compilar wolverine_pw.so
 wpctl                # instalado (botões de mídia)
-python-libusb1       # ⚠️ A INSTALAR — necessário p/ o Passo 1 (iso assíncrono)
+python-libusb1       # instalado (3.3.1) — EP3 iso assíncrono (módulo iso_audio.py)
 ```
 
 ---

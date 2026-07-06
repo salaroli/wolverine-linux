@@ -25,6 +25,14 @@ import usb.util
 from evdev import UInput, AbsInfo, ecodes
 
 try:
+    from iso_audio import IsoAudio
+    _ISO_OK = True
+except ImportError as _iso_err:
+    _ISO_OK = False
+    print(f"WARNING: iso_audio/usb1 unavailable ({_iso_err}) — "
+          "falling back to synchronous EP3 path (robotic voice)")
+
+try:
     from cryptography.hazmat.primitives.asymmetric import padding as _rsa_pad
     from cryptography.hazmat.primitives.serialization import load_der_public_key as _load_der_pub
     from cryptography.hazmat.primitives.asymmetric.ec import (
@@ -1368,15 +1376,25 @@ PLAY_PRIME_BYTES = EP3_OUT_PCM * 20
 
 
 def stream_audio_out(dev, stop: threading.Event, pw) -> None:
-    """Drain the PipeWire sink ring to EP3 OUT. The device plays raw 192-byte S16
-    stereo PCM (48 frames); the earlier <u16 len> prefix was actually played as a
-    sample, causing a left-channel buzz and a half-frame misalignment (crackle) —
-    so we send raw PCM by default (WOLV_OUT_HEADER=1 restores the old prefix).
+    """Synchronous fallback for EP3 OUT (used only when the async iso engine can't
+    come up). Each packet is a GIP AUDIO_SAMPLES frame — `60 21 <seq> <len>` header
+    + 192B S16 stereo PCM — exactly like xone's gip_copy_audio_samples() and the
+    async path; sending raw PCM makes the device render a robotic voice. This path
+    still gaps between synchronous writes (worse pacing than the async engine), but
+    at least produces correctly-framed audio.
 
     Once primed, a transient dip sends a single silence packet (1 ms) but keeps
-    the stream primed, so we never punch an 8 ms re-prime gap (robotic artifact)."""
-    prefix  = struct.pack("<H", EP3_OUT_PCM) if os.environ.get("WOLV_OUT_HEADER") else b""
-    silence = prefix + bytes(EP3_OUT_PCM)
+    the stream primed, so we never punch a multi-ms re-prime gap."""
+    out_seq = 1
+
+    def frame(pcm: bytes) -> bytes:
+        nonlocal out_seq
+        hdr = build_gip_header(GIP_CMD_AUDIO_SAMPLES,
+                               GIP_CLIENT_ID | GIP_OPT_INTERNAL, out_seq, EP3_OUT_PCM)
+        out_seq = out_seq + 1 if out_seq < 255 else 1
+        return hdr + pcm
+
+    silence_pcm = bytes(EP3_OUT_PCM)
     rbuf    = ctypes.create_string_buffer(EP3_OUT_PCM)
     errors  = 0
     primed  = False
@@ -1386,14 +1404,14 @@ def stream_audio_out(dev, stop: threading.Event, pw) -> None:
     sent = under = 0
     avail_min = avail_max = 0
     last_dbg = time.time()
-    print(f"[audio-out] EP3 OUT header={'u16 len' if prefix else 'NONE (raw PCM)'} "
-          f"← PipeWire sink 'Wolverine Headphones'"
+    print("[audio-out] EP3 OUT (sync fallback, GIP-framed) "
+          "← PipeWire sink 'Wolverine Headphones'"
           if pw else "[audio-out] EP3 OUT (silence — no PipeWire bridge)")
 
     while not stop.is_set():
         if pending is None:
             if pw is None:
-                pending = silence
+                pending = frame(silence_pcm)
                 is_sil  = True
             else:
                 avail = pw.wpw_playback_avail()
@@ -1401,14 +1419,14 @@ def stream_audio_out(dev, stop: threading.Event, pw) -> None:
                 avail_max = max(avail_max, avail)
                 if not primed:
                     primed  = avail >= PLAY_PRIME_BYTES
-                    pending = silence
+                    pending = frame(silence_pcm)
                     is_sil  = True
                 elif avail >= EP3_OUT_PCM:
                     pw.wpw_read_playback(rbuf, EP3_OUT_PCM)
-                    pending = prefix + rbuf.raw[:EP3_OUT_PCM]
+                    pending = frame(rbuf.raw[:EP3_OUT_PCM])
                     is_sil  = False
                 else:
-                    pending = silence          # transient underrun: 1 ms gap only
+                    pending = frame(silence_pcm)   # transient underrun: 1 ms gap only
                     is_sil  = True
         try:
             dev.write(EP_AUDIO_OUT, pending, timeout=5)
@@ -1498,16 +1516,24 @@ def main():
         sys.exit(1)
     print(f"Found: {dev.manufacturer} {dev.product} (bus {dev.bus}, addr {dev.address})")
 
-    print("\nDetaching kernel drivers and claiming all interfaces...")
+    print("\nDetaching kernel drivers and claiming interfaces...")
+    # Detach xpad from all interfaces, but only *claim* 0 (GIP) and 2 (bulk) via
+    # pyusb. Interface 1 (EP3 iso audio) is left unclaimed here so the async iso
+    # engine (usb1) can own it — the two libusb handles hold different interfaces.
+    # If the iso engine is unavailable we claim interface 1 below as a fallback.
     for iface in [0, 1, 2]:
         try:
             if dev.is_kernel_driver_active(iface):
                 dev.detach_kernel_driver(iface)
                 print(f"  xpad/kernel detached from interface {iface}")
-            usb.util.claim_interface(dev, iface)
-            print(f"  Interface {iface} claimed")
         except usb.core.USBError as e:
-            print(f"  Interface {iface}: {e}")
+            print(f"  Interface {iface} detach: {e}")
+    for iface in [0, 2]:
+        try:
+            usb.util.claim_interface(dev, iface)
+            print(f"  Interface {iface} claimed (pyusb)")
+        except usb.core.USBError as e:
+            print(f"  Interface {iface} claim: {e}")
 
     print("\nCreating virtual gamepad (uinput)...")
     try:
@@ -1529,14 +1555,15 @@ def main():
     # Auth and audio format negotiation happen with alt=0 (isochronous endpoints idle).
     seq_ref = gip_init(dev)
 
-    # Activate alt=1 — isochronous endpoints come alive after format negotiation
-    print("\nActivating isochronous endpoints (alt setting 1)...")
-    for iface in [1, 2]:
-        try:
-            dev.set_interface_altsetting(interface=iface, alternate_setting=1)
-            print(f"  Interface {iface} alt=1 active")
-        except usb.core.USBError as e:
-            print(f"  Interface {iface} alt setting: {e}")
+    # Activate alt=1 — isochronous/bulk endpoints come alive after format
+    # negotiation. Interface 1 (EP3 audio) is activated by the iso engine (usb1)
+    # in IsoAudio.start(); here pyusb only brings up interface 2 (EP2 bulk).
+    print("\nActivating alt setting 1 on interface 2 (bulk)...")
+    try:
+        dev.set_interface_altsetting(interface=2, alternate_setting=1)
+        print(f"  Interface 2 alt=1 active")
+    except usb.core.USBError as e:
+        print(f"  Interface 2 alt setting: {e}")
 
     time.sleep(0.1)
 
@@ -1554,11 +1581,43 @@ def main():
             print(f"  WARNING: wpw_start failed (rc={rc}) — audio devices disabled")
             pw = None
 
-    print("Starting EP3 audio streams...")
-    t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop, pw), daemon=True)
-    t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop, pw), daemon=True)
-    t_audio_out.start()
-    t_audio_in.start()
+    # EP3 audio. Preferred path: async isochronous via usb1 (keeps N transfers in
+    # flight so the host controller never gaps → kills the robotic voice). If that
+    # can't come up, fall back to the old synchronous per-packet threads (which do
+    # gap, but at least produce audio).
+    iso = None
+    t_audio_out = t_audio_in = None
+    if _ISO_OK:
+        print("Starting async isochronous EP3 engine (usb1)...")
+        try:
+            # Each OUT iso packet is a GIP AUDIO_SAMPLES frame: `60 21 <seq> <len>`
+            # header + 192 PCM bytes (mirrors xone's gip_copy_audio_samples).
+            def _build_out_header(seq):
+                return build_gip_header(GIP_CMD_AUDIO_SAMPLES,
+                                        GIP_CLIENT_ID | GIP_OPT_INTERNAL,
+                                        seq, EP3_OUT_PCM)
+            iso = IsoAudio(pw, dev.bus, dev.address,
+                           decode_gip_header, GIP_CMD_AUDIO_SAMPLES,
+                           _build_out_header)
+            iso.start()
+        except Exception as e:
+            print(f"  WARNING: iso engine failed to start ({e}) — "
+                  "falling back to synchronous EP3 path")
+            iso = None
+
+    if iso is None:
+        # Fallback: pyusb must own interface 1 (claim + alt=1) for the sync path.
+        print("Starting synchronous EP3 audio threads...")
+        try:
+            usb.util.claim_interface(dev, 1)
+            dev.set_interface_altsetting(interface=1, alternate_setting=1)
+            print("  Interface 1 claimed (pyusb) + alt=1")
+        except usb.core.USBError as e:
+            print(f"  Interface 1 sync setup: {e}")
+        t_audio_out = threading.Thread(target=stream_audio_out, args=(dev, stop, pw), daemon=True)
+        t_audio_in  = threading.Thread(target=monitor_audio,   args=(dev, stop, pw), daemon=True)
+        t_audio_out.start()
+        t_audio_in.start()
 
     print("\n" + "=" * 60)
     print("MONITORING — press buttons, media keys, plug headset")
@@ -1579,8 +1638,14 @@ def main():
         stop.set()
         print("\nStopping...")
 
+    # Stop the iso engine first (cancels its transfers and releases interface 1
+    # from usb1) before pyusb tears the rest down.
+    if iso is not None:
+        iso.stop()
+
     for t in [*threads, t_audio_out, t_audio_in]:
-        t.join(timeout=1)
+        if t is not None:
+            t.join(timeout=1)
 
     if pw is not None:
         pw.wpw_stop()
