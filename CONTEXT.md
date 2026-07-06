@@ -16,8 +16,10 @@ O gamepad em si já funciona nativamente via driver `xpad` do kernel.
 | Áudio saída (fones) | ✅ **voz limpa** via PipeWire (sink *Wolverine Headphones*) — iso assíncrono + enquadramento GIP |
 | Áudio entrada (mic) | ✅ funciona via PipeWire (source *Wolverine Microphone*), formato **24kHz mono** confirmado |
 | Botões de mídia | ✅ volume + mic mute espelhados no PipeWire |
+| Rumble / force feedback | ✅ `FF_RUMBLE` → GIP rumble (cmd 0x09) |
 | ~~Voz robótica~~ (saída) | ✅ **RESOLVIDO** — a causa era **formato** (faltava header GIP no OUT), não timing (ver seção dedicada) |
 | ~~Buzz canal esquerdo~~ | ✅ **RESOLVIDO** — sumiu junto com o fix do enquadramento GIP; **não era hardware** (ver seção dedicada) |
+| ~~Latência de áudio~~ | ✅ **RESOLVIDO** — ring com bound no consumidor (drop-oldest) + mic respeita `requested`; baixa e ajustável (ver seção dedicada) |
 
 > **Marco (breakthrough):** o áudio do jack **funciona no Linux**. A conclusão
 > anterior de "limitação de hardware irreversível" estava **errada**. O elo perdido
@@ -154,10 +156,12 @@ capturado. É a próxima frente.
 3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito.*
 4. ✅ **Voz robótica corrigida** — iso assíncrono (usb1) **+ enquadramento GIP no OUT**. *Feito.* Ver seção dedicada.
 5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
-6. 🚧 **Rewrite em Rust** (branch `feat/rust-rewrite`) — driver único, nativo, sem
-   Python/ctypes/shim C. **Todos os módulos prontos e validados no hardware.** Ver seção dedicada.
+6. ✅ **Rewrite em Rust** — driver único, nativo, sem Python/ctypes/shim C.
+   **Todos os módulos prontos e validados no hardware.** *Feito.* Ver seção dedicada.
 7. ✅ **Daemon systemd** — `packaging/` tem unit + regra udev + `install.sh`. Ativado por
    udev (sobe no plug/boot, sai no unplug); mira a sessão PipeWire do usuário via `WOLVERINE_UID`.
+8. ✅ **Latência de áudio** — ring com bound no consumidor (drop-oldest) + mic respeita
+   `requested`; baixa e ajustável por env. *Feito.* Ver seção dedicada.
 
 ## Botões de mídia — RESOLVIDO
 
@@ -472,34 +476,108 @@ sudo ./target/release/wolverined audio           # só o bridge PipeWire (sem US
 O Python em `tools/` continua válido como referência/legado; o Rust é o caminho
 do produto final.
 
-### Estado atual (handoff) e próximos passos
+### Estado atual — SOLUÇÃO COMPLETA
 
 **Feito e validado no hardware:** driver Rust feature-complete (gamepad com mapa
 xpad + Guide, áudio limpo, mic, botões de mídia, rumble) **+ daemon systemd**
 (`packaging/`: unit + regra udev + `install.sh`, ativado por udev, ciclo de vida
-limpo no plug/unplug/replug).
+limpo no plug/unplug/replug) **+ latência de áudio resolvida** (baixa, sem corte,
+ajustável por env).
 
-**Estado do git:** `main` tem PR #1 (gip-init legado) e PR #2 (rewrite Rust)
-mergeados. **PR #3** (`feat/systemd-daemon`) aberta com o daemon, aguardando merge.
+**Estado do git:** `main` tem PRs #1–#4 mergeados (gip-init legado, rewrite Rust,
+daemon systemd). O **PR #5** (`fix/audio-latency`) fecha a latência de áudio — é o
+PR **final** da solução. Não há próximos passos pendentes.
 
-**⏳ PRÓXIMO FOCO — latência de áudio (voz sai atrasada).** Ainda não investigado.
-Ordem sugerida (mais provável → menos):
-1. **Baixar o priming de OUT:** `OUT_PRIME_BYTES` em `iso.rs` (hoje `192*40` = ~40ms)
-   → ~10–15ms. É latência fixa embutida antes de drenar áudio real.
-2. **Menos runway em voo:** `OUT_NUM_XFERS`×`OUT_PKTS_PER_XFER` em `iso.rs`
-   (hoje 6×8 = ~48ms) → ex. 4×4. Corta latência ao custo de menos folga contra gaps.
-3. **Hint de latência no PipeWire:** passar `PW_KEY_NODE_LATENCY` (quantum menor)
-   nas properties do sink em `audio.rs`.
-4. **Instrumentar antes de chutar:** o log `[iso] … ring XB` já mostra a fila em
-   regime; medir quantos ms acumulam e ajustar por dado.
+**✅ RESOLVIDO — latência de áudio.** Branch `fix/audio-latency` (PR #5, final).
 
-⚠️ Trade-off **latência × underrun**: baixar demais o priming/runway pode trazer de
-volta a voz robótica (gaps no stream iso). É trabalho **iterativo com teste no
-hardware** — mexe num parâmetro, escuta, ajusta.
+### ⚠️ CAUSA RAIZ (descoberta depois): ring ILIMITADO, não o piso
 
-**Para retomar:** após mergear a PR #3, `git checkout main && git pull`, criar
-`fix/audio-latency`, ajustar os parâmetros acima e testar (`sudo systemctl restart
-wolverined`, ou rodar o binário à mão com fones no jack e falar/tocar áudio).
+O teste no Discord mostrou delay de **segundos**, não de ms — o que **refuta** a hipótese
+inicial (afinar priming/quantum/runway, que são todos <100ms). Segundos só têm uma
+explicação nesta arquitetura: **o ring buffer enche e fica cheio**.
+
+- Capacidade: playback `256KB` = **1,37s**; capture/mic `256KB` @ 24kHz mono = **5,46s**.
+- Os dois lados de cada ring rodam em **clocks independentes** (grafo do PipeWire ×
+  SOF do USB). Qualquer drift faz o ring encher monotonicamente. A política do `rtrb` é
+  **drop-newest**: quando cheio, descarta o áudio **novo** e mantém o **velho** → você fica
+  permanentemente ~1,4s (saída) / ~5,5s (mic) atrás.
+- Pior no mic: a thread USB IN produz PCM **continuamente** desde o bring-up, mas nada drena
+  o ring até o Discord abrir o mic — então ele já chega no full de 5,5s antes do primeiro uso.
+- O CONTEXT antigo assumia "streams rate-matched + priming ⇒ drop-newest OK". **Errado:**
+  os clocks não são o mesmo clock; priming/quantum só mexem no **piso**, nunca no **teto**.
+
+**Fix (o que resolve os segundos):** limitar a profundidade do ring **no consumidor**
+(drop-oldest), como o shim C fazia. `ring::skip()` descarta os mais antigos; o consumidor
+de cada ring drena o excesso pra manter só os ~`target` bytes mais frescos:
+- **Playback** (`iso.rs` `on_out`): trima acima de `prime_bytes + histerese` → volta pra ~priming.
+- **Mic** (`audio.rs` source `process`): trima acima de `cap_high` → alvo `WOLVERINE_CAP_MS`
+  (default 100ms). Na primeira captura do Discord, o ring cheio é aparado num tranco → latência
+  corrigida já no primeiro buffer.
+- Diagnóstico: o log `[iso]` agora mostra `…B trimmed/5s` (quanto drift está sendo aparado).
+
+### ⚠️ Regressão do primeiro fix: mic cortava na primeira sílaba (RESOLVIDO)
+
+Depois do trim, os segundos sumiram mas o mic passou a **cortar** — só a primeira sílaba
+da fala passava. Duas causas somadas no `process` do source:
+1. O callback lia `slice.len()` (= **maxsize**, o buffer mapeado inteiro) todo ciclo e
+   **ignorava `pw_buffer.requested`** (os frames que o PipeWire quer no quantum). O shim C
+   (`on_process_capture`) usa `requested`; o Rust não usava.
+2. O trim esvaziava o ring do mic até `cap_low` (40ms). Como `want`(maxsize) > 40ms, cada
+   ciclo lia ~40ms reais e **preenchia o resto com silêncio** → primeira sílaba e depois nada.
+
+**Fix (mesma branch):**
+- `Cargo.toml`: habilitar feature **`v0_3_49`** do pipewire-rs → expõe `Buffer::requested()`
+  (encadeia `spa/v0_3_33`, compatível com o 1.6.6). Compila limpo.
+- `audio.rs` source `process`: **respeitar `requested`** (`want = requested*stride`, clamp em
+  maxsize; fallback maxsize se 0) e tornar o trim **want-aware** — `low = max(cap_low, want)`,
+  `high = max(cap_high, 2*want)`. Garante que o ring nunca fica **abaixo** do que a leitura
+  precisa → sem gutting, independente de `requested`. Default `WOLVERINE_CAP_MS` 40 → **100**.
+
+**Lição:** um consumidor PipeWire não deve encher `maxsize` cego — usar `requested` (frames
+do quantum), como o driver de referência. E um bound de latência no consumidor **nunca** pode
+deixar menos que uma leitura precisa, senão vira silêncio.
+
+**Lição (a mesma do projeto):** medir o sintoma real antes de afinar. "Latência alta" tem
+duas causas ortogonais — piso (buffers de pipeline, ms) e teto (ring sem bound, segundos).
+O relato "segundos" apontava direto pro teto; os knobs de piso eram a árvore errada.
+
+### Piso (o trabalho original — ainda válido pra afinar de ~100ms pra ~30ms)
+
+A cadeia de buffering **nossa** na saída (playback → fones) — tudo latência somável:
+
+| Estágio | Buffer | Onde | Knob (env) |
+|---|---|---|---|
+| Quantum do PipeWire (sink) | ~21–43ms (default do grafo) | `audio.rs` | `WOLVERINE_QUANTUM` (frames, default 512 ≈ 10.6ms) |
+| Priming do ring OUT | 40ms fixo | `iso.rs` | `WOLVERINE_PRIME_MS` (default 40) |
+| Transfers iso em voo | 48ms (6×8 pkt de 1ms) | `iso.rs` | `WOLVERINE_OUT_XFERS`×`WOLVERINE_OUT_PKTS` (default 6×8) |
+| DAC do device | pequeno | firmware | — |
+
+**O que já foi feito nesta branch:**
+1. **Hint `PW_KEY_NODE_LATENCY`** no sink **e** source (`audio.rs`) — pede quantum menor
+   (`<frames>/<rate>`), default 512 frames. Corta o buffering do PipeWire e, como encolhe
+   os bursts do produtor, **permite** baixar o priming sem underrun. Baixo risco.
+2. **Priming, nº de transfers e pacotes/transfer viraram env-tunáveis** (`iso.rs`), com os
+   **defaults conhecidos-bons** (40ms / 6 / 8) — a primeira execução não regride. O log de
+   bring-up agora imprime `Xms in flight, Yms prime`, e o `[iso] … ring XB` a cada 5s mostra
+   a fila em regime (medir antes de chutar).
+
+**Sinergia importante:** baixar `WOLVERINE_QUANTUM` primeiro; com bursts menores dá pra
+baixar `WOLVERINE_PRIME_MS` junto sem trazer a voz robótica de volta.
+
+**Procedimento de sweep (hardware no loop, sem recompilar):**
+```bash
+sudo systemctl stop wolverined                        # libera o device
+cd rust && cargo build --release
+# rodar à mão com fones no jack; SUDO_UID mira a sessão PipeWire do usuário
+sudo WOLVERINE_QUANTUM=256 WOLVERINE_PRIME_MS=15 WOLVERINE_OUT_XFERS=4 \
+     RUST_LOG=info ./target/release/wolverined
+# falar/tocar áudio, escutar. Ajustar os números, repetir. Ctrl+C entre tentativas.
+```
+Quando achar o ponto ideal: fixar como defaults nos `DEFAULT_*` consts, `sudo cp
+target/release/wolverined /usr/local/bin/`, `sudo systemctl start wolverined`.
+
+⚠️ Trade-off **latência × underrun**: baixar demais o priming/runway traz de volta a voz
+robótica (gaps no stream iso). Iterativo — mexe, escuta, ajusta.
 
 ---
 

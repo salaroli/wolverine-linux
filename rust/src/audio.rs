@@ -37,6 +37,21 @@ pub const IN_CHANNELS: u32 = 1;
 /// ~1.3s at 96 KB/s; generous, like the C shim's 512 KiB.
 const RING_CAPACITY: usize = 256 * 1024;
 
+/// Requested node quantum (frames) for the sink/source, exposed as a
+/// `PW_KEY_NODE_LATENCY` hint (`<frames>/<rate>`). Smaller = less PipeWire-side
+/// buffering (the default graph quantum is often 1024–2048 = 21–43ms at 48kHz),
+/// which also lets the iso OUT priming drop without underrunning. Overridable
+/// via `WOLVERINE_QUANTUM` for hardware-in-the-loop latency tuning.
+const DEFAULT_QUANTUM: u32 = 512;
+
+fn quantum_frames() -> u32 {
+    std::env::var("WOLVERINE_QUANTUM")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&q| q > 0)
+        .unwrap_or(DEFAULT_QUANTUM)
+}
+
 /// USB-side ring endpoints handed to the iso engine (iso.rs).
 pub struct Rings {
     /// System playback audio to drain into EP3 OUT (sink `process` produces it).
@@ -170,6 +185,15 @@ fn run_pw(
 
     let in_stride = (in_channels as usize) * std::mem::size_of::<i16>();
 
+    // Latency hint: request a small quantum so PipeWire buffers less ahead of us.
+    let quantum = quantum_frames();
+    let sink_latency = format!("{quantum}/{out_rate}");
+    let source_latency = format!("{quantum}/{in_rate}");
+    log::info!(
+        "requesting node latency: sink {sink_latency}, source {source_latency} \
+         (quantum {quantum} frames; set WOLVERINE_QUANTUM to tune)"
+    );
+
     // --- sink: "Wolverine Headphones" (system plays in, we read it out) ---
     let sink = pw::stream::StreamBox::new(
         &core,
@@ -179,6 +203,7 @@ fn run_pw(
             *pw::keys::MEDIA_CLASS => "Audio/Sink",
             *pw::keys::NODE_NAME => "wolverine_headphones",
             *pw::keys::NODE_DESCRIPTION => "Wolverine Headphones",
+            *pw::keys::NODE_LATENCY => sink_latency,
         },
     )?;
     let _sink_listener = sink
@@ -213,6 +238,20 @@ fn run_pw(
         &mut sink_params,
     )?;
 
+    // Capture (mic) latency cap. The USB IN side produces mic PCM continuously
+    // from bring-up, but nothing drains this ring until an app (e.g. Discord)
+    // opens the mic — so it fills to its full ~5s and, being drop-newest, stays
+    // there: seconds of delay. Keep only the freshest `cap_low` bytes, trimming
+    // the oldest excess once past `cap_high` (hysteresis). Tunable via
+    // WOLVERINE_CAP_MS (target latency in ms).
+    let cap_ms = std::env::var("WOLVERINE_CAP_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(100);
+    let cap_low = (in_rate as usize * in_stride * cap_ms / 1000).max(in_stride);
+    let cap_high = cap_low * 2;
+
     // --- source: "Wolverine Microphone" (we fill mic PCM, system records) ---
     let source = pw::stream::StreamBox::new(
         &core,
@@ -222,6 +261,7 @@ fn run_pw(
             *pw::keys::MEDIA_CLASS => "Audio/Source",
             *pw::keys::NODE_NAME => "wolverine_mic",
             *pw::keys::NODE_DESCRIPTION => "Wolverine Microphone",
+            *pw::keys::NODE_LATENCY => source_latency,
         },
     )?;
     let _source_listener = source
@@ -230,17 +270,41 @@ fn run_pw(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // How many frames PipeWire wants THIS quantum (mirrors the C shim's
+            // `b->requested`). Read before datas_mut() borrows the buffer mut.
+            // 0 = no hint → fall back to the full mapped buffer below.
+            let requested = buffer.requested() as usize;
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
             }
             let d = &mut datas[0];
             let want = if let Some(slice) = d.data() {
-                let frames = slice.len() / in_stride;
-                let want = frames * in_stride;
+                // slice.len() is the full mapped buffer (maxsize). Serve only the
+                // requested quantum, not the whole buffer — over-reading maxsize
+                // and zero-padding the shortfall is what clipped speech to the
+                // first syllable once the ring was trimmed shallow.
+                let maxbytes = (slice.len() / in_stride) * in_stride;
+                let want = if requested > 0 {
+                    (requested * in_stride).min(maxbytes)
+                } else {
+                    maxbytes
+                };
+
+                // Bound mic latency, but never below what this read needs, so the
+                // trim can't starve the buffer into silence. Drop the oldest
+                // excess down to `low` once past `high` (hysteresis).
+                let low = cap_low.max(want);
+                let high = cap_high.max(want * 2);
+                let avail = ring::avail(&cap_cons);
+                if avail > high {
+                    let excess = avail - low;
+                    ring::skip(&mut cap_cons, excess - excess % in_stride);
+                }
+
                 let got = ring::read(&mut cap_cons, &mut slice[..want]);
                 for b in &mut slice[got..want] {
-                    *b = 0; // underrun -> silence
+                    *b = 0; // genuine underrun -> silence
                 }
                 want
             } else {

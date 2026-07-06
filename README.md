@@ -16,6 +16,7 @@ implementation lives in [`tools/`](tools) and documents the reverse engineering.
 | Microphone (input) | ✅ PipeWire source **Wolverine Microphone** (24 kHz mono) |
 | Media buttons (volume / mic mute) | ✅ Mirrored to the system default sink/source |
 | Rumble / force feedback | ✅ `FF_RUMBLE` → GIP rumble command |
+| Audio latency | ✅ Bounded & low — consumer-side ring trim (drop-oldest); tunable |
 
 Everything above is validated on real hardware.
 
@@ -78,6 +79,29 @@ cargo run --release -- audio
 > and the media-button volume/mute target the invoking user's PipeWire session
 > (via `SUDO_UID` / `XDG_RUNTIME_DIR`), so the devices show up in your normal
 > audio settings.
+
+### Audio latency
+
+Audio is **low-latency by default** and the depth is **bounded**: the sink and
+source (PipeWire) and the isochronous USB engine run off independent clocks, so
+each ring is trimmed on the consumer side (drop-oldest) to keep only the freshest
+audio — without this the rings drift full and add seconds of delay. The mic also
+honours PipeWire's per-quantum request (`pw_buffer.requested`) so it never
+over-reads and clips speech.
+
+The defaults are tuned for real hardware. To trade latency against underrun
+robustness, set these env vars (all optional):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `WOLVERINE_CAP_MS` | `100` | Max mic (capture) latency, ms. Lower = tighter, more underrun risk. |
+| `WOLVERINE_QUANTUM` | `512` | PipeWire node quantum (frames). Lower = less buffering. |
+| `WOLVERINE_PRIME_MS` | `40` | Playback ring prime/target depth, ms. |
+| `WOLVERINE_OUT_XFERS` / `WOLVERINE_OUT_PKTS` | `6` / `8` | Isochronous OUT transfers in flight (ms of runway). |
+
+```bash
+sudo WOLVERINE_CAP_MS=50 WOLVERINE_QUANTUM=256 ./target/release/wolverined
+```
 
 ## Install as a service (systemd + udev)
 

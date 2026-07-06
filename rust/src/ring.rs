@@ -34,3 +34,23 @@ pub fn read(c: &mut Consumer<u8>, dst: &mut [u8]) -> usize {
 pub fn avail(c: &Consumer<u8>) -> usize {
     c.slots()
 }
+
+/// Discard up to `n` bytes from the front (the OLDEST data). Returns the number
+/// skipped. Used by consumers to bound latency: the two ends run off independent
+/// clocks (PipeWire graph vs USB SOF), so without this the ring drifts to full
+/// and stays there (drop-newest), adding seconds of delay. Dropping oldest here
+/// keeps only the freshest `target` bytes — the C shim's drop-oldest policy,
+/// enforced on the consumer side (rtrb SPSC only lets the consumer pop).
+pub fn skip(c: &mut Consumer<u8>, n: usize) -> usize {
+    let n = n.min(c.slots());
+    if n == 0 {
+        return 0;
+    }
+    match c.read_chunk(n) {
+        Ok(chunk) => {
+            chunk.commit_all();
+            n
+        }
+        Err(_) => 0,
+    }
+}

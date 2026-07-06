@@ -46,14 +46,30 @@ const OUT_PCM_BYTES: usize = 192;
 /// IN: read up to the endpoint's max packet (228); actual_length tells the truth.
 const IN_PKT_BYTES: usize = 228;
 
-const OUT_PKTS_PER_XFER: usize = 8;
-const OUT_NUM_XFERS: usize = 6;
+// OUT (playback) pipeline depth. Each iso packet is one 1ms frame, so
+// `xfers × pkts_per_xfer` ms of audio sit scheduled ahead on the bus — that is
+// added latency. Fewer/smaller = lower latency but less cushion against a
+// starved frame (robotic voice returns if pushed too far). Defaults are the
+// known-good values; all three are overridable for hardware-in-the-loop tuning.
+const DEFAULT_OUT_PKTS_PER_XFER: usize = 8;
+const DEFAULT_OUT_NUM_XFERS: usize = 6;
+/// Prime the playback ring to ~this many 1ms frames before draining real audio,
+/// so a bursty PipeWire quantum can't leave us mid-stream with an empty ring.
+/// This is the ring's steady-state depth (rate-matched streams), i.e. fixed
+/// added latency. Lower it together with `WOLVERINE_QUANTUM` (audio.rs).
+const DEFAULT_PRIME_MS: usize = 40;
+
 const IN_PKTS_PER_XFER: usize = 8;
 const IN_NUM_XFERS: usize = 4;
 
-/// Prime the playback ring to ~40ms before draining real audio, so a bursty
-/// PipeWire quantum can't leave us mid-stream with an empty ring.
-const OUT_PRIME_BYTES: usize = OUT_PCM_BYTES * 40;
+/// Read a positive `usize` from `var`, falling back to `default`.
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
 
 /// Shared state reachable from the libusb completion callbacks via `user_data`.
 /// After `start()`, every non-atomic field is touched ONLY by the libusb event
@@ -65,11 +81,14 @@ struct EngineState {
     cap: ring::Producer<u8>,  // mic audio received on EP3 IN
     out_hdr: Vec<u8>,         // GIP AUDIO_SAMPLES header template; byte[2] = seq
     out_pkt_size: usize,      // out_hdr.len() + OUT_PCM_BYTES (iso packet stride)
+    out_pkts_per_xfer: usize, // iso packets per OUT transfer (callback refill count)
+    prime_bytes: usize,       // ring depth to reach before draining real audio
     out_seq: u8,              // GIP sequence 1..=255 (never 0)
     primed: bool,
     running: AtomicBool,
     out_pkts: u64,
     out_silence: u64,
+    out_trimmed: u64, // bytes dropped to bound playback latency (clock drift)
     in_bytes: u64,
 }
 
@@ -96,6 +115,11 @@ impl IsoAudio {
         playback: ring::Consumer<u8>,
         capture: ring::Producer<u8>,
     ) -> Result<Self> {
+        // Latency knobs (env-tunable; see the DEFAULT_* consts).
+        let out_pkts_per_xfer = env_usize("WOLVERINE_OUT_PKTS", DEFAULT_OUT_PKTS_PER_XFER);
+        let out_num_xfers = env_usize("WOLVERINE_OUT_XFERS", DEFAULT_OUT_NUM_XFERS);
+        let prime_bytes = OUT_PCM_BYTES * env_usize("WOLVERINE_PRIME_MS", DEFAULT_PRIME_MS);
+
         unsafe {
             let mut ctx: *mut ffi::libusb_context = ptr::null_mut();
             if ffi::libusb_init(&mut ctx) < 0 {
@@ -131,11 +155,14 @@ impl IsoAudio {
                 cap: capture,
                 out_hdr,
                 out_pkt_size,
+                out_pkts_per_xfer,
+                prime_bytes,
                 out_seq: 1,
                 primed: false,
                 running: AtomicBool::new(true),
                 out_pkts: 0,
                 out_silence: 0,
+                out_trimmed: 0,
                 in_bytes: 0,
             }));
 
@@ -143,10 +170,10 @@ impl IsoAudio {
             let mut bufs = Vec::new();
 
             // OUT transfers (start as silence).
-            let out_total = out_pkt_size * OUT_PKTS_PER_XFER;
-            for _ in 0..OUT_NUM_XFERS {
+            let out_total = out_pkt_size * out_pkts_per_xfer;
+            for _ in 0..out_num_xfers {
                 let mut buf = vec![0u8; out_total];
-                let xfer = ffi::libusb_alloc_transfer(OUT_PKTS_PER_XFER as c_int);
+                let xfer = ffi::libusb_alloc_transfer(out_pkts_per_xfer as c_int);
                 if xfer.is_null() {
                     bail!("libusb_alloc_transfer (OUT) failed");
                 }
@@ -156,7 +183,7 @@ impl IsoAudio {
                     EP_AUDIO_OUT,
                     buf.as_mut_ptr(),
                     out_total as c_int,
-                    OUT_PKTS_PER_XFER as c_int,
+                    out_pkts_per_xfer as c_int,
                     on_out,
                     engine as *mut c_void,
                     0,
@@ -201,9 +228,10 @@ impl IsoAudio {
                 .map_err(|e| anyhow::anyhow!("spawn iso thread: {e}"))?;
 
             log::info!(
-                "iso EP3 engine up — OUT {OUT_NUM_XFERS}×{OUT_PKTS_PER_XFER}pkt \
-                 ({}ms in flight), IN {IN_NUM_XFERS}×{IN_PKTS_PER_XFER}pkt",
-                OUT_NUM_XFERS * OUT_PKTS_PER_XFER
+                "iso EP3 engine up — OUT {out_num_xfers}×{out_pkts_per_xfer}pkt \
+                 ({}ms in flight, {}ms prime), IN {IN_NUM_XFERS}×{IN_PKTS_PER_XFER}pkt",
+                out_num_xfers * out_pkts_per_xfer,
+                prime_bytes / OUT_PCM_BYTES,
             );
             Ok(Self {
                 ctx,
@@ -280,13 +308,27 @@ extern "system" fn on_out(transfer: *mut ffi::libusb_transfer) {
         }
 
         // Wait for a cushion before draining real audio.
-        if !st.primed && ring::avail(&st.play) >= OUT_PRIME_BYTES {
+        if !st.primed && ring::avail(&st.play) >= st.prime_bytes {
             st.primed = true;
+        }
+
+        // Bound playback latency: PipeWire (producer) and the USB SOF (consumer)
+        // run off independent clocks, so any drift makes the ring creep toward
+        // full and stay there (drop-newest) — seconds of delay. When it grows
+        // past the prime target + hysteresis, drop the oldest excess so only the
+        // freshest ~prime_bytes remain. Aligned to the 4-byte stereo frame.
+        if st.primed {
+            let avail = ring::avail(&st.play);
+            let high = st.prime_bytes + st.prime_bytes.max(OUT_PCM_BYTES);
+            if avail > high {
+                let excess = (avail - st.prime_bytes) & !3;
+                st.out_trimmed += ring::skip(&mut st.play, excess) as u64;
+            }
         }
 
         let base = (*transfer).buffer;
         let hlen = st.out_hdr.len();
-        for i in 0..OUT_PKTS_PER_XFER {
+        for i in 0..st.out_pkts_per_xfer {
             let off = i * st.out_pkt_size;
 
             // GIP header with the next sequence (1..=255, never 0).
@@ -366,14 +408,16 @@ fn event_loop(ctx: *mut ffi::libusb_context, engine: *mut EngineState) {
                 let st = &mut *engine;
                 let secs = dt.as_secs_f64();
                 log::info!(
-                    "[iso] OUT {:.0} pkt/s ({} silent/5s, ring {}B) | IN {:.0} PCM B/s",
+                    "[iso] OUT {:.0} pkt/s ({} silent, {}B trimmed/5s, ring {}B) | IN {:.0} PCM B/s",
                     st.out_pkts as f64 / secs,
                     st.out_silence,
+                    st.out_trimmed,
                     ring::avail(&st.play),
                     st.in_bytes as f64 / secs,
                 );
                 st.out_pkts = 0;
                 st.out_silence = 0;
+                st.out_trimmed = 0;
                 st.in_bytes = 0;
             }
             last = Instant::now();

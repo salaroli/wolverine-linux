@@ -33,7 +33,11 @@ async-io = "2"
 # (tools/wolverine_pw.c) and expose SPA audio-format building natively.
 # 0.8 failed to build against the system PipeWire 1.6.6 (spa_pod_builder layout
 # changed); trying 0.10 which is newer.
-pipewire = "0.10"
+# v0_3_49 exposes `Buffer::requested()` — the per-quantum frame count PipeWire
+# wants on a capture stream (mirrors the C shim's `b->requested`). Needed so the
+# mic source doesn't over-read the whole mapped buffer. Chains to spa/v0_3_33,
+# backwards-compatible with system 1.6.6.
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 libspa = "0.10"
 
 # uinput — re-expose the gamepad and a separate keyboard-only device for media keys.
