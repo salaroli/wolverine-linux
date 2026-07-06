@@ -139,59 +139,64 @@ capturado. É a próxima frente.
 ## Roadmap
 
 1. ✅ **Áudio (protocolo)** — jack e mic funcionam via POWER ON. *Feito.*
-2. 🚧 **Botões de mídia** — foco atual (abaixo).
-3. ⏳ **Integração de áudio com PipeWire/ALSA** — transformar o I/O isócrono raw num
-   sink virtual (fones) + source virtual (mic) do sistema. Depois dos botões.
+2. ✅ **Botões de mídia** — volume e mic mute espelhados no PipeWire. *Feito.* (abaixo)
+3. ⏳ **Integração de áudio com PipeWire/ALSA** — FOCO ATUAL. Transformar o I/O isócrono
+   raw num sink virtual (fones) + source virtual (mic) do sistema.
 4. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot.
 
-## Próximos passos — FOCO ATUAL: botões de mídia
+## Botões de mídia — RESOLVIDO
 
-### Estado da investigação
+### Onde eles realmente estão (não era onde a gente procurava)
 
-O GIP INPUT report (cmd=0x20) do Wolverine tem **14 bytes de payload** — 2 bytes a mais que o padrão Xbox (12 bytes). O `gip_init.py` já loga esses bytes extras:
+A hipótese inicial era que os botões de volume/mídia estariam nos **bytes 12-13 do
+INPUT report** (cmd 0x20). **Errado.** Aqueles bytes extras (`8dfc`, `98fb`…) são
+provavelmente os paddles/botões remapeáveis traseiros — não os de mídia.
+
+Os botões de áudio chegam pelo canal **`AUDIO_CONTROL` sub `0x00` (VOLUME_CHAT)**, no
+EP1, o mesmo do gamepad. O firmware do controle mantém o estado e só reporta o resultado:
 
 ```
-bytes 0-1:   buttons bitmask (u16) — botões A/B/X/Y/LB/RB/start/select/etc
-byte 2:      LT (0-255)
-byte 3:      RT (0-255)
-bytes 4-5:   LX (i16)
-bytes 6-7:   LY (i16)
-bytes 8-9:   RX (i16)
-bytes 10-11: RY (i16)
-bytes 12-13: ??? — CANDIDATOS PARA BOTÕES DE MÍDIA
+data[5] = mute state do mic   (0x04 unmuted / 0x05 mic-muted)
+data[6] = volume absoluto      (0x00..0x64 = 0..100)
 ```
 
-O código em `tools/gip_init.py` já tem:
-```python
-if len(payload) >= 14:
-    extra = payload[12:14]
-    if any(extra):
-        print(f"[input] EXTRA bytes 12-13: {extra.hex()} (media buttons?)")
-```
+### Comportamento físico (manual oficial)
 
-### Como investigar
+É **um único botão de áudio multifunção** (não +/− separados):
+- **Clique** → aumenta o volume master.
+- **Segurar + D-pad ↑/↓** → ajuste fino (↑ sobe, ↓ desce). É o único jeito de **baixar**.
+- **Segurar + D-pad ←/→** → balanço game/chat (só Xbox One).
+- **Mic mute** é um botão separado (acende quando muta).
 
-```bash
-sudo python3 tools/gip_init.py
-# Apertar os botões de volume +/- e mute/mídia do controle
-# Observar se aparece: [input] EXTRA bytes 12-13: XXXX
-```
+Como o firmware resolve a combinação e reporta só o volume absoluto resultante, o driver
+não precisa de lógica de "hold" — basta rastrear a direção da mudança de `data[6]`.
 
-Se bytes 12-13 mudarem ao pressionar os botões → temos o mapeamento.
+### Implementação (`forward_media` em gip_init.py)
 
-### Plano completo (após confirmar mapeamento)
+- **Modo absoluto (default, `MEDIA_MODE_ABSOLUTE=True`):** espelha no PipeWire via `wpctl`
+  — `set-volume @DEFAULT_AUDIO_SINK@ <v/100>` e `set-mute @DEFAULT_AUDIO_SOURCE@ 1/0`.
+  O botão de volume vira o slider do sistema (sync 1:1). Roda como o usuário invocador
+  (`SUDO_USER`/`XDG_RUNTIME_DIR`) porque o PipeWire vive na sessão do usuário, não do root.
+- **Modo teclas (`MEDIA_MODE_ABSOLUTE=False`):** emite `KEY_VOLUMEUP/DOWN` + `KEY_MICMUTE`.
+- As media keys saem de um **uinput separado só-teclado** — o libinput classifica o
+  gamepad (ABS + BTN) como joystick e **engoliria** as KEY_* dele. Device keyboard puro
+  é entregue ao Hyprland como teclado de verdade.
+- Age só em **mudanças**; o primeiro report é baseline (conectar não puxa o volume).
 
-1. **Mapear os bits:** quais bits de bytes 12-13 correspondem a volume+, volume-, mute
-2. **Adicionar ao uinput:** registrar `KEY_VOLUMEUP`, `KEY_VOLUMEDOWN`, `KEY_MUTE` no dispositivo virtual
-3. **Criar daemon systemd:** script que detacha xpad, re-expõe gamepad + botões de mídia, inicia no boot
-4. **Estrutura do daemon:** manter xpad detachado apenas enquanto daemon estiver rodando (cleanup no stop)
+---
 
-### Alternativa se bytes 12-13 forem sempre zero
+## Próximos passos — FOCO ATUAL: integração de áudio com PipeWire
 
-Os botões de mídia podem aparecer em outro canal:
-- EP2 IN (bulk, interface 2, alt=1) — o monitor de ctrl já está ativo no `gip_init.py`
-- GIP VIRTUAL_KEY (cmd=0x07) — comando que o Wolverine pode usar para teclas extras
-- Como eventos HID separados (interface diferente)
+Hoje o `gip_init.py` faz I/O isócrono **raw**: lê o mic (EP3 IN) pra lugar nenhum e só
+toca um tom de teste no EP3 OUT. Falta expor isso como dispositivos de áudio do sistema:
+
+- **Sink virtual (fones):** o que o sistema tocar nesse sink → empacotar em GIP
+  AUDIO_SAMPLES (cmd 0x60) e escrever no EP3 OUT.
+- **Source virtual (mic):** os AUDIO_SAMPLES que chegam no EP3 IN → decodificar (PCM
+  16-bit LE, 48kHz stereo) e empurrar pro source.
+- **Como conectar:** provavelmente via módulo `pipewire`/`pw-cli` ou um `snd-aloop` +
+  bridge, ou um cliente PipeWire nativo. Avaliar a abordagem mais simples e estável.
+- Cuidar de formato/timing (1000 pacotes/s, ~1ms) e latência.
 
 ---
 
@@ -201,7 +206,7 @@ Os botões de mídia podem aparecer em outro canal:
 
 Driver userspace completo. Faz:
 1. Detacha xpad de todas as interfaces
-2. Cria gamepad virtual via uinput
+2. Cria gamepad virtual via uinput + um uinput separado só-teclado p/ media keys
 3. Drena buffer pré-IDENTIFY
 4. Envia IDENTIFY e recebe/ACKa resposta (suporte a chunks sem CHUNK_START)
 5. Tenta GIP auth (falha graciosamente — device não suporta, e não é necessário p/ jack)
@@ -209,7 +214,8 @@ Driver userspace completo. Faz:
 7. **Envia POWER ON (`pkt_power`, cmd 0x05) — acorda o áudio.** VOLUME fica sob flag `SEND_HW_VOLUME`
 8. Ativa alt=1 nas interfaces 1 e 2
 9. Monitora EP1 IN (GIP/gamepad), EP2 IN (ctrl/bulk), EP3 IN/OUT (áudio — agora com PCM real)
-10. Loga bytes 12-13 dos INPUT reports para investigação de botões de mídia
+10. **Botões de mídia:** `forward_media()` espelha volume/mic mute no PipeWire (via `wpctl`)
+    a partir dos reports `AUDIO_CONTROL` sub 0x00
 
 ### `tools/probe_gip.py` + `probe_results.log`
 

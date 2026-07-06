@@ -9,7 +9,7 @@ Open-source Linux driver for the Razer Wolverine Ultimate controller's audio jac
 | Gamepad (buttons, sticks, triggers) | ✅ Works (kernel xpad driver, re-exposed via uinput) |
 | Headphone jack (output) | ✅ Works at protocol level — raw playback confirmed audible; PipeWire/ALSA integration pending |
 | Microphone (input) | ✅ Works at protocol level — raw capture confirmed flowing; PipeWire/ALSA integration pending |
-| Media buttons | 🚧 Under investigation |
+| Media buttons (volume / mic mute) | ✅ Works — mirrored to PipeWire (volume) and mic mute |
 
 > **Audio breakthrough:** the 3.5mm jack is **not** an Xbox-only hardware limitation.
 > Both output (DAC) and input (ADC) work on Linux. The missing piece was the GIP
@@ -30,7 +30,11 @@ Open-source Linux driver for the Razer Wolverine Ultimate controller's audio jac
 | 1 | 0 | — | Idle | none |
 | 1 | 1 | EP3 IN/OUT (Isochronous, 228B) | **Audio** | none |
 | 2 | 0 | — | Idle | none |
-| 2 | 1 | EP2 IN/OUT (Bulk, 64B) | **Control / Media buttons** | none |
+| 2 | 1 | EP2 IN/OUT (Bulk, 64B) | Control / events | none |
+
+> Media buttons (volume / mic mute) do **not** ride on EP2 — they arrive as GIP
+> `AUDIO_CONTROL` sub `0x00` (VOLUME_CHAT) reports on EP1, the same channel as the
+> gamepad. `data[5]` = mic mute state, `data[6]` = absolute volume (0–100).
 
 ## Architecture
 
