@@ -47,22 +47,28 @@ fn main() -> Result<()> {
     // 3. Audio bring-up on EP1 (IDENTIFY / AUDIO_FORMAT / POWER ON).
     //    This is the crown-jewel path: if POWER ON lands, the DAC/ADC wake up.
     dev.bring_up_audio()?;
+    let (bus, addr) = dev.bus_addr();
 
-    // --- Everything below is not implemented yet (stubs). Until iso.rs /
-    //     audio.rs / input.rs land, `wolverined` runs the handshake and exits,
-    //     which is a valid smoke-test of the bring-up sequence on real hardware.
-    log::info!("handshake complete — remaining stages (audio/iso/input) not implemented yet");
+    // 4. PipeWire sink + source in the invoking user's session.
+    let (_bridge, rings) = audio::Bridge::start(
+        audio::OUT_RATE,
+        audio::OUT_CHANNELS,
+        audio::IN_RATE,
+        audio::IN_CHANNELS,
+    )?;
 
-    // 2. Virtual input devices.                    (input.rs — pending)
-    // let _uinput = input::Uinput::create()?;
-    // 4. PipeWire sink + source (user session).     (audio.rs — pending, blocked on pipewire-rs)
-    // let _bridge = audio::Bridge::start()?;
-    // 5. Async isochronous EP3 engine.              (iso.rs — pending)
-    // let _iso = iso::IsoAudio::start()?;
-    // 6. Blocking event loop: gamepad + media.      (usb.rs::run_event_loop — pending)
+    // 5. Async isochronous EP3 engine (libusb; claims interface 1 AFTER the EP1
+    //    handshake). Bridges the PipeWire rings to EP3 OUT/IN.
+    let _iso = iso::IsoAudio::start(bus, addr, rings.playback, rings.capture)?;
+
+    log::info!("audio running — select 'Wolverine Headphones' / 'Wolverine Microphone'. Ctrl+C to stop.");
+
+    // 6. Blocking event loop: gamepad + media buttons.  (input.rs — pending)
+    //    For now just park so the audio keeps flowing.
     // dev.run_event_loop()?;
-
-    Ok(())
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Audio-only smoke test (no USB): start the PipeWire bridge and park.

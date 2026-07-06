@@ -39,6 +39,8 @@ pub struct Device {
     gip: Interface,  // interface 0 — EP1 GIP
     ctrl: Interface, // interface 2 — EP2 bulk
     seq: gip::SeqCounter,
+    bus: u8,
+    addr: u8,
 }
 
 impl Device {
@@ -49,12 +51,14 @@ impl Device {
         let info = nusb::list_devices()?
             .find(|d| d.vendor_id() == gip::VID && d.product_id() == gip::PID)
             .ok_or_else(|| anyhow!("Wolverine ({:04x}:{:04x}) not found", gip::VID, gip::PID))?;
+        let bus = info.bus_number();
+        let addr = info.device_address();
         log::info!(
             "found {} {} (bus {}, addr {})",
             info.manufacturer_string().unwrap_or("?"),
             info.product_string().unwrap_or("Wolverine"),
-            info.bus_number(),
-            info.device_address()
+            bus,
+            addr
         );
 
         let dev = info.open()?;
@@ -72,13 +76,14 @@ impl Device {
             gip,
             ctrl,
             seq: gip::SeqCounter::default(),
+            bus,
+            addr,
         })
     }
 
-    /// A clone of the underlying device so the iso engine can claim interface 1
-    /// independently (nusb::Device is Arc-backed and cheap to clone).
-    pub fn nusb_device(&self) -> nusb::Device {
-        self.dev.clone()
+    /// USB bus/address, so the iso engine (libusb) can match the same device.
+    pub fn bus_addr(&self) -> (u8, u8) {
+        (self.bus, self.addr)
     }
 
     /// Run the audio bring-up handshake on EP1 (ported from `gip_init`):

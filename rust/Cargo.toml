@@ -11,9 +11,18 @@ name = "wolverined"
 path = "src/main.rs"
 
 [dependencies]
-# USB — pure-Rust async transport; fits the isochronous EP3 engine well.
-# (rusb/libusb is the fallback option if nusb's iso support is insufficient.)
+# USB (EP1 GIP handshake + EP2 events): pure-Rust interrupt/bulk transport.
+# Handshake is validated on hardware against 0.1; no reason to move to 0.2's
+# endpoint API since NEITHER 0.1 nor 0.2 exposes isochronous transfers.
 nusb = "0.1"
+
+# USB (EP3 isochronous audio): raw libusb. nusb has no public iso API, so the
+# EP3 engine (iso.rs) drives libusb directly — a faithful port of the Python
+# iso_audio.py (which uses python-libusb1). Two handles to the same device
+# (nusb usbfs + libusb), each owning different interfaces, mirrors the proven
+# pyusb+usb1 hybrid. Unsafe FFI is isolated to iso.rs.
+libusb1-sys = "0.7"
+libc = "0.2" # timeval for libusb_handle_events_timeout
 
 # Minimal async plumbing: nusb transfers are futures, so we block_on them and
 # race against a timer for the request/response handshake timeouts.
