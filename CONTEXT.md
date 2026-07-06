@@ -151,7 +151,7 @@ capturado. É a próxima frente.
 
 1. ✅ **Áudio (protocolo)** — jack e mic funcionam via POWER ON. *Feito.*
 2. ✅ **Botões de mídia** — volume e mic mute espelhados no PipeWire. *Feito.*
-3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito, com 2 bugs abertos.*
+3. ✅ **Integração de áudio com PipeWire** — sink + source nativos via shim C. *Feito.*
 4. ✅ **Voz robótica corrigida** — iso assíncrono (usb1) **+ enquadramento GIP no OUT**. *Feito.* Ver seção dedicada.
 5. ✅ **Buzz canal esquerdo** — sumiu junto com o fix do enquadramento GIP (não era hardware). *Feito.* Ver seção dedicada.
 6. ⏳ **Daemon systemd** — empacotar tudo (detach xpad, gamepad + botões + áudio) no boot. **PRÓXIMO FOCO.**
