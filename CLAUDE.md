@@ -25,7 +25,7 @@ conhecido.** Antes de afirmar estado, confira o `git log` e a seção "Status" d
 |---|---|
 | `README.md` | status, uso, variáveis de ambiente (`WOLVERINE_*`), instalação como serviço |
 | `CONTEXT.md` | **fonte de contexto**: protocolo GIP, mapa USB, decisões do rewrite em Rust, causas-raiz de cada problema resolvido |
-| `docs/usb-analysis.md`, `usb-analysis.md` | análise dos descritores USB |
+| `docs/usb-analysis.md` | análise dos descritores USB |
 | `rust/src/` | `wolverined` (`iso.rs` motor isócrono EP3 via `libusb1-sys`; `audio.rs` PipeWire nativo, `pipewire-rs` 0.10 com feature `v0_3_49`) |
 | `packaging/` | `install.sh`, unit systemd, regra udev |
 
